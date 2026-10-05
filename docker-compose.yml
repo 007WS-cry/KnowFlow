@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knowflow}
+      POSTGRES_USER: ${POSTGRES_USER:-knowflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-knowflow_dev_password}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-knowflow_redis_dev_password}
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"
+    ports:
+      - '${REDIS_PUBLISHED_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$${REDIS_PASSWORD}" ping | grep -q PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: knowflow-minio:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: .
+      dockerfile: Dockerfile.minio
+      args:
+        MINIO_VERSION: RELEASE.2025-10-15T17-29-55Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-knowflow_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-knowflow_minio_dev_secret}
+    command: server /data
+    ports:
+      - '${MINIO_PUBLISHED_PORT:-9000}:9000'
+    volumes:
+      - minio_data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 8000
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-knowflow}:${POSTGRES_PASSWORD:-knowflow_dev_password}@postgres:5432/${POSTGRES_DB:-knowflow}?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-knowflow_redis_dev_password}
+      REDIS_DB: ${REDIS_DB:-0}
+      BULLMQ_PREFIX: ${BULLMQ_PREFIX:-bull}
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: 'false'
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-knowflow_minio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-knowflow_minio_dev_secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-knowflow-documents}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10485760}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+    ports:
+      - '${PORT:-8000}:8000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

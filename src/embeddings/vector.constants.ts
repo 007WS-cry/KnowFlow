@@ -1,0 +1,1 @@
+export const VECTOR_DIMENSIONS = 1536;

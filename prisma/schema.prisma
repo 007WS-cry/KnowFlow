@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model User {
+  id              String            @id @default(cuid())
+  email           String            @unique
+  name            String?
+  passwordHash    String?
+  createdAt       DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime          @updatedAt @db.Timestamptz(6)
+  workspaceMembers WorkspaceMember[]
+  sessions        Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model Workspace {
+  id               String            @id @default(cuid())
+  name             String
+  slug             String            @unique
+  createdAt        DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime          @updatedAt @db.Timestamptz(6)
+  members          WorkspaceMember[]
+  knowledgeBases   KnowledgeBase[]
+}
+
+model WorkspaceMember {
+  id          String        @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        WorkspaceRole @default(MEMBER)
+  createdAt   DateTime      @default(now()) @db.Timestamptz(6)
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+model KnowledgeBase {
+  id          String     @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  createdAt   DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(6)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  documents   Document[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId])
+}
+
+model Document {
+  id              String         @id @default(cuid())
+  knowledgeBaseId String
+  originalName    String
+  mimeType        String
+  objectKey       String         @unique
+  sizeBytes       BigInt
+  status          DocumentStatus @default(PENDING)
+  errorMessage    String?
+  processedAt     DateTime?      @db.Timestamptz(6)
+  createdAt       DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime       @updatedAt @db.Timestamptz(6)
+  knowledgeBase   KnowledgeBase  @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  chunks          Chunk[]
+
+  @@index([knowledgeBaseId, status])
+}
+
+model Chunk {
+  id         String   @id @default(cuid())
+  documentId String
+  chunkIndex Int
+  content    String
+  embedding  Unsupported("vector(1536)")?
+  metadata   Json?    @db.JsonB
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
+}
