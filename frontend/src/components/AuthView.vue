@@ -73,14 +73,14 @@ function toggleMode(): void {
           <span>KnowFlow</span>
         </div>
         <div class="auth-intro-copy">
-          <p class="eyebrow">PERSONAL KNOWLEDGE WORKSPACE</p>
+          <p class="eyebrow">TEAM KNOWLEDGE WORKSPACE</p>
           <h1>让知识流动起来。</h1>
-          <p>把分散的资料收进来，随时向自己的知识库提问。</p>
+          <p>把团队资料集中起来，在统一权限下协作检索与提问。</p>
         </div>
         <div class="auth-feature-list">
           <div><span class="feature-icon"><el-icon><Document /></el-icon></span><span>文档集中管理</span></div>
           <div><span class="feature-icon"><el-icon><Search /></el-icon></span><span>答案附带来源</span></div>
-          <div><span class="feature-icon"><el-icon><Lock /></el-icon></span><span>个人空间隔离</span></div>
+          <div><span class="feature-icon"><el-icon><Lock /></el-icon></span><span>Workspace 权限隔离</span></div>
         </div>
         <div class="auth-intro-foot">简洁、清晰，专注你的知识本身。</div>
       </div>
@@ -134,7 +134,7 @@ function toggleMode(): void {
             <el-button link type="primary" @click="toggleMode">{{ isRegister ? '返回登录' : '创建账号' }}</el-button>
           </div>
         </el-card>
-        <p class="auth-legal">登录即表示你在本地使用 KnowFlow 个人知识库服务。</p>
+        <p class="auth-legal">登录即表示你在本地使用 KnowFlow 团队知识库服务。</p>
       </div>
     </section>
   </main>

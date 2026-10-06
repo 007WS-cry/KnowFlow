@@ -1,10 +1,9 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../storage/minio.service';
 import { QueueService } from '../queue/queue.service';
 import { WorkspacesService } from './workspaces.service';
 
-describe('WorkspacesService', () => {
+describe('WorkspacesService persistence operations', () => {
   const workspace = {
     id: 'workspace-1',
     name: 'Team',
@@ -18,21 +17,23 @@ describe('WorkspacesService', () => {
   };
   const prismaMock = {
     $transaction: jest.fn((callback: (tx: typeof transaction) => unknown) => callback(transaction)),
-    workspaceMember: { findMany: jest.fn(), findUnique: jest.fn() },
-    workspace: { update: jest.fn(), delete: jest.fn() },
+    workspaceMember: { findMany: jest.fn() },
+    workspace: {
+      findUniqueOrThrow: jest.fn(),
+      update: jest.fn(),
+      delete: jest.fn(),
+    },
     document: { findMany: jest.fn() },
   };
   const removeObject = jest.fn().mockResolvedValue(undefined);
   const cancelDocumentProcessing = jest.fn().mockResolvedValue(undefined);
-  const storage = {
-    getClient: () => ({ removeObject }),
-    getBucket: () => 'knowflow-documents',
-  };
-  const queue = { cancelDocumentProcessing };
   const service = new WorkspacesService(
     prismaMock as unknown as PrismaService,
-    storage as unknown as MinioService,
-    queue as unknown as QueueService,
+    {
+      getClient: () => ({ removeObject }),
+      getBucket: () => 'knowflow-documents',
+    } as unknown as MinioService,
+    { cancelDocumentProcessing } as unknown as QueueService,
   );
 
   beforeEach(() => {
@@ -40,7 +41,7 @@ describe('WorkspacesService', () => {
     prismaMock.$transaction.mockImplementation((callback: (tx: typeof transaction) => unknown) =>
       callback(transaction),
     );
-    prismaMock.workspaceMember.findUnique.mockResolvedValue({ role: 'OWNER', workspace });
+    prismaMock.workspace.findUniqueOrThrow.mockResolvedValue(workspace);
     prismaMock.workspace.update.mockResolvedValue({ ...workspace, name: 'Updated' });
     prismaMock.workspace.delete.mockResolvedValue(workspace);
     prismaMock.document.findMany.mockResolvedValue([]);
@@ -64,44 +65,28 @@ describe('WorkspacesService', () => {
     );
   });
 
-  it('gets and updates only an owned workspace', async () => {
-    await expect(service.getForUser('user-1', workspace.id)).resolves.toMatchObject({
-      id: workspace.id,
-      role: 'OWNER',
-    });
-    await expect(service.update('user-1', workspace.id, ' Updated ')).resolves.toMatchObject({
+  it('performs get and update after the central policy guard authorizes the request', async () => {
+    await expect(service.get(workspace.id)).resolves.toMatchObject({ id: workspace.id });
+    await expect(service.update(workspace.id, ' Updated ')).resolves.toMatchObject({
       name: 'Updated',
-      role: 'OWNER',
     });
     expect(prismaMock.workspace.update).toHaveBeenCalledWith({
       where: { id: workspace.id },
       data: { name: 'Updated' },
     });
-
-    prismaMock.workspaceMember.findUnique.mockResolvedValueOnce(null);
-    await expect(service.update('other-user', workspace.id, 'No access')).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
-    expect(prismaMock.workspace.update).toHaveBeenCalledTimes(1);
   });
 
-  it('allows only the owner to delete and cleans associated objects and jobs', async () => {
+  it('cleans associated objects and jobs when deleting a workspace', async () => {
     prismaMock.document.findMany.mockResolvedValue([
       { id: 'doc-1', objectKey: 'workspace/kb/doc-1' },
       { id: 'doc-2', objectKey: 'workspace/kb/doc-2' },
     ]);
-    await expect(service.delete('user-1', workspace.id)).resolves.toEqual({
+    await expect(service.delete(workspace.id)).resolves.toEqual({
       success: true,
       id: workspace.id,
     });
     expect(cancelDocumentProcessing).toHaveBeenCalledTimes(2);
     expect(removeObject).toHaveBeenCalledTimes(2);
     expect(prismaMock.workspace.delete).toHaveBeenCalledWith({ where: { id: workspace.id } });
-
-    prismaMock.workspaceMember.findUnique.mockResolvedValueOnce({ role: 'MEMBER', workspace });
-    await expect(service.delete('member-1', workspace.id)).rejects.toBeInstanceOf(
-      ForbiddenException,
-    );
-    expect(prismaMock.workspace.delete).toHaveBeenCalledTimes(1);
   });
 });

@@ -6,7 +6,7 @@ import { Queue } from 'bullmq';
 import { AddressInfo } from 'node:net';
 import { createServer, Server } from 'node:http';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse as parseEnv } from 'dotenv';
 import request from 'supertest';
@@ -15,6 +15,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { QueueService } from '../queue/queue.service';
 import { DOCUMENT_PROCESSING_QUEUE } from '../queue/queue.constants';
 import { DocumentProcessor } from '../documents/document-processor';
+import {
+  calculateMetrics,
+  evaluateQuestionResult,
+  EvaluationQuestion,
+  QueryResponse,
+} from './evaluation/run-evaluation';
 
 interface PromptSource {
   citation: number;
@@ -67,23 +73,59 @@ function databaseUrlFor(databaseUrl: string, databaseName: string): string {
 
 function parsePrompt(body: string): { question: string; sources: PromptSource[] } {
   const requestBody = JSON.parse(body) as PromptRequest;
-  const userMessage = requestBody.messages.find((message) => message.role === 'user');
+  const userMessage = requestBody.messages.filter((message) => message.role === 'user').at(-1);
   if (!userMessage) throw new Error('LLM request has no user message');
   return JSON.parse(userMessage.content) as { question: string; sources: PromptSource[] };
 }
 
-function fakeAnswer(sources: PromptSource[]): string {
-  const paris = sources.find((source) => source.content.includes('巴黎是法国首都'));
+async function uploadMarkdown(
+  server: ReturnType<INestApplication['getHttpServer']>,
+  authorization: Record<string, string>,
+  knowledgeBaseId: string,
+  originalName: string,
+  content: Buffer,
+): Promise<UploadedDocument> {
+  const started = await request(server)
+    .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents/uploads`)
+    .set(authorization)
+    .send({ originalName, sizeBytes: content.length })
+    .expect(201);
+  if (started.body.uploadMode !== 'single' || typeof started.body.uploadUrl !== 'string') {
+    throw new Error('Acceptance Markdown fixture should use a single MinIO PUT');
+  }
+  const uploaded = await fetch(started.body.uploadUrl as string, {
+    method: 'PUT',
+    body: content as unknown as BodyInit,
+  });
+  if (!uploaded.ok) throw new Error(`Presigned MinIO PUT returned HTTP ${uploaded.status}`);
+  const completed = await request(server)
+    .post(`/api/v1/documents/${started.body.document.id}/uploads/complete`)
+    .set(authorization)
+    .send({})
+    .expect(201);
+  return completed.body as UploadedDocument;
+}
+
+function fakeAnswer(question: string, sources: PromptSource[]): string {
+  const paris =
+    question.includes('法国') &&
+    sources.find((source) => source.content.includes('巴黎是法国首都'));
   if (paris) return `巴黎是法国首都。[${paris.citation}]`;
 
-  const travel = sources.find(
-    (source) => source.content.includes('北京、上海、深圳') && source.content.includes('600 元'),
-  );
+  const travel =
+    question.includes('上海') &&
+    sources.find(
+      (source) => source.content.includes('北京、上海、深圳') && source.content.includes('600 元'),
+    );
   if (travel) return `北京、上海、深圳住宿上限为每晚 600 元。[${travel.citation}]`;
 
-  const lyon = sources.find((source) => source.content.includes('法国首都是里昂'));
+  const lyon =
+    question.includes('法国') &&
+    sources.find((source) => source.content.includes('法国首都是里昂'));
   if (lyon) return `隔离知识库中的资料写明法国首都是里昂。[${lyon.citation}]`;
 
+  const first = sources[0];
+  if (first) return `${first.content.slice(0, 160)} [${first.citation}]`;
   return '提供的知识来源中没有足够信息回答这个问题。';
 }
 
@@ -131,19 +173,52 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
 
     llmServer = createServer((incoming, outgoing) => {
       const bodyChunks: Buffer[] = [];
+      const requestPath = incoming.url ?? '';
       incoming.on('data', (chunk: Buffer | string) => {
         bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
       incoming.on('end', () => {
         try {
-          const prompt = parsePrompt(Buffer.concat(bodyChunks).toString('utf8'));
-          llmPrompts.push(prompt);
-          outgoing.writeHead(200, { 'Content-Type': 'application/json' });
-          outgoing.end(
-            JSON.stringify({
-              choices: [{ message: { content: fakeAnswer(prompt.sources) } }],
-            }),
-          );
+          const body = JSON.parse(Buffer.concat(bodyChunks).toString('utf8')) as Record<
+            string,
+            unknown
+          >;
+          if (requestPath.endsWith('/embeddings')) {
+            outgoing.writeHead(200, { 'Content-Type': 'application/json' });
+            const input = body.input as string[];
+            outgoing.end(
+              JSON.stringify({
+                data: input.map((text, index) => ({ index, embedding: fakeEmbedding(text) })),
+              }),
+            );
+          } else if (requestPath.endsWith('/rerank')) {
+            outgoing.writeHead(200, { 'Content-Type': 'application/json' });
+            const query = String(body.query ?? '');
+            const documents = body.documents as string[];
+            const results = documents
+              .map((text, index) => ({ index, relevance_score: fakeRerankScore(query, text) }))
+              .sort((left, right) => right.relevance_score - left.relevance_score);
+            outgoing.end(JSON.stringify({ results }));
+          } else if (requestPath.endsWith('/chat/completions')) {
+            const prompt = parsePrompt(Buffer.concat(bodyChunks).toString('utf8'));
+            llmPrompts.push(prompt);
+            const answer = fakeAnswer(prompt.question, prompt.sources);
+            if (body.stream === true) {
+              outgoing.writeHead(200, { 'Content-Type': 'text/event-stream' });
+              for (let offset = 0; offset < answer.length; offset += 12) {
+                outgoing.write(
+                  `data: ${JSON.stringify({ choices: [{ delta: { content: answer.slice(offset, offset + 12) } }] })}\n\n`,
+                );
+              }
+              outgoing.end('data: [DONE]\n\n');
+            } else {
+              outgoing.writeHead(200, { 'Content-Type': 'application/json' });
+              outgoing.end(JSON.stringify({ choices: [{ message: { content: answer } }] }));
+            }
+          } else {
+            outgoing.writeHead(404);
+            outgoing.end(JSON.stringify({ error: 'unknown test endpoint' }));
+          }
         } catch {
           outgoing.writeHead(400, { 'Content-Type': 'application/json' });
           outgoing.end(JSON.stringify({ error: 'invalid test prompt' }));
@@ -161,6 +236,16 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     setTestEnvironment('LLM_BASE_URL', `http://127.0.0.1:${llmPort}/v1`);
     setTestEnvironment('LLM_API_KEY', 'local-acceptance-test-key');
     setTestEnvironment('LLM_MODEL', 'acceptance-test-model');
+    setTestEnvironment('EMBEDDING_PROVIDER', 'openai-compatible');
+    setTestEnvironment('EMBEDDING_BASE_URL', `http://127.0.0.1:${llmPort}/v1`);
+    setTestEnvironment('EMBEDDING_API_KEY', 'local-acceptance-test-key');
+    setTestEnvironment('EMBEDDING_MODEL', 'acceptance-embedding-model');
+    setTestEnvironment('EMBEDDING_VERSION', 'acceptance-v1');
+    setTestEnvironment('EMBEDDING_DIMENSIONS', '3');
+    setTestEnvironment('RERANKER_PROVIDER', 'compatible');
+    setTestEnvironment('RERANKER_BASE_URL', `http://127.0.0.1:${llmPort}/v1`);
+    setTestEnvironment('RERANKER_API_KEY', 'local-acceptance-test-key');
+    setTestEnvironment('RERANKER_MODEL', 'acceptance-reranker');
     setTestEnvironment('BULLMQ_PREFIX', `knowflow-rag-test-${process.pid}-${Date.now()}`);
 
     const { AppModule } = await import('../app.module');
@@ -262,12 +347,15 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     ] as const;
     const primaryDocuments: UploadedDocument[] = [];
     for (const [filename, path] of sourceFiles) {
-      const response = await request(server)
-        .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/documents`)
-        .set(ownerAuth)
-        .attach('file', readFileSync(path), { filename, contentType: 'text/markdown' })
-        .expect(201);
-      primaryDocuments.push(response.body as UploadedDocument);
+      primaryDocuments.push(
+        await uploadMarkdown(
+          server,
+          ownerAuth,
+          targetKnowledgeBase.body.id as string,
+          filename,
+          readFileSync(path),
+        ),
+      );
     }
 
     const semanticFixtures = [
@@ -276,12 +364,15 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
       ['apple.md', '苹果是一种水果。'],
     ] as const;
     for (const [filename, content] of semanticFixtures) {
-      const response = await request(server)
-        .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/documents`)
-        .set(ownerAuth)
-        .attach('file', Buffer.from(content), { filename, contentType: 'text/markdown' })
-        .expect(201);
-      primaryDocuments.push(response.body as UploadedDocument);
+      primaryDocuments.push(
+        await uploadMarkdown(
+          server,
+          ownerAuth,
+          targetKnowledgeBase.body.id as string,
+          filename,
+          Buffer.from(content),
+        ),
+      );
     }
 
     const secondRegistration = await request(server)
@@ -303,15 +394,13 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
       .set(secondUserAuth)
       .send({ name: 'Private source' })
       .expect(201);
-    const decoyResponse = await request(server)
-      .post(`/api/v1/knowledge-bases/${isolatedKnowledgeBase.body.id}/documents`)
-      .set(secondUserAuth)
-      .attach('file', Buffer.from('法国首都是里昂。'), {
-        filename: 'other-workspace-decoy.md',
-        contentType: 'text/markdown',
-      })
-      .expect(201);
-    const isolatedDocument = decoyResponse.body as UploadedDocument;
+    const isolatedDocument = await uploadMarkdown(
+      server,
+      secondUserAuth,
+      isolatedKnowledgeBase.body.id as string,
+      'other-workspace-decoy.md',
+      Buffer.from('法国首都是里昂。'),
+    );
 
     await waitForDocumentsReady(
       server,
@@ -343,19 +432,37 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     ).toBe(true);
 
     const persistedVectors = await app.get(PrismaService).$queryRaw<
-      Array<{ total: number; embedded: number; dimensions: number }>
+      Array<{
+        total: number;
+        embedded: number;
+        dimensions: number;
+        profileRows: number;
+        model: string;
+        version: string;
+      }>
     >(Prisma.sql`
       SELECT
         COUNT(*)::int AS total,
         COUNT(c."embedding")::int AS embedded,
-        MIN(vector_dims(c."embedding"))::int AS dimensions
+        MIN(vector_dims(c."embedding"))::int AS dimensions,
+        COUNT(*) FILTER (
+          WHERE c."embeddingProvider" = 'openai-compatible'
+            AND c."embeddingModel" = 'acceptance-embedding-model'
+            AND c."embeddingVersion" = 'acceptance-v1'
+            AND c."embeddingDimension" = 3
+        )::int AS "profileRows",
+        MIN(c."embeddingModel") AS model,
+        MIN(c."embeddingVersion") AS version
       FROM "Chunk" c
       INNER JOIN "Document" d ON d."id" = c."documentId"
       WHERE d."knowledgeBaseId" = ${targetKnowledgeBase.body.id}
     `);
     expect(persistedVectors[0]!.total).toBeGreaterThan(3);
     expect(persistedVectors[0]!.embedded).toBe(persistedVectors[0]!.total);
-    expect(persistedVectors[0]!.dimensions).toBe(1536);
+    expect(persistedVectors[0]!.dimensions).toBe(3);
+    expect(persistedVectors[0]!.profileRows).toBe(persistedVectors[0]!.total);
+    expect(persistedVectors[0]!.model).toBe('acceptance-embedding-model');
+    expect(persistedVectors[0]!.version).toBe('acceptance-v1');
 
     const parisAnswer = await request(server)
       .post('/api/v1/query')
@@ -386,14 +493,62 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     const travelAnswer = await request(server)
       .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/query`)
       .set(ownerAuth)
-      .send({ question: '上海的住宿报销上限是多少？', topK: 5 })
+      .send({ question: '上海的住宿报销上限是多少？', topK: 5, debug: true })
       .expect(201);
     expect(travelAnswer.body.answer).toContain('600 元');
+    expect(travelAnswer.body.retrievalDebug.vectorCandidateCount).toBeGreaterThan(0);
+    expect(travelAnswer.body.retrievalDebug.keywordCandidateCount).toBeGreaterThan(0);
+    expect(
+      travelAnswer.body.retrievalDebug.candidates.some(
+        (candidate: { vectorRank: number | null; keywordRank: number | null }) =>
+          candidate.vectorRank !== null && candidate.keywordRank !== null,
+      ),
+    ).toBe(true);
+    expect(
+      travelAnswer.body.retrievalDebug.candidates.every(
+        (candidate: { fusionScore: number; rerankScore: number | null }) =>
+          Number.isFinite(candidate.fusionScore) &&
+          (candidate.rerankScore === null || Number.isFinite(candidate.rerankScore)),
+      ),
+    ).toBe(true);
     expect(
       travelAnswer.body.sources.some(
         (source: { documentName: string }) => source.documentName === 'travel-policy.md',
       ),
     ).toBe(true);
+    expect(travelAnswer.body.sources[0]).toHaveProperty('headingPath');
+
+    const savedConversation = await request(server)
+      .post('/api/v1/conversations')
+      .set(ownerAuth)
+      .send({ knowledgeBaseId: targetKnowledgeBase.body.id, title: '差旅政策追问' })
+      .expect(201);
+    const firstStream = await request(server)
+      .post(`/api/v1/conversations/${savedConversation.body.id}/messages/stream`)
+      .set(ownerAuth)
+      .send({ question: '上海住宿上限是多少？' })
+      .expect(200);
+    expect(firstStream.headers['content-type']).toContain('text/event-stream');
+    expect(firstStream.text).toContain('event: sources');
+    expect(firstStream.text).toContain('event: delta');
+    expect(firstStream.text).toContain('event: complete');
+    const secondStream = await request(server)
+      .post(`/api/v1/conversations/${savedConversation.body.id}/messages/stream`)
+      .set(ownerAuth)
+      .send({ question: '请再说明来源中还有哪些住宿城市？' })
+      .expect(200);
+    expect(secondStream.text).toContain('event: complete');
+    const savedMessages = await request(server)
+      .get(`/api/v1/conversations/${savedConversation.body.id}/messages`)
+      .set(ownerAuth)
+      .expect(200);
+    expect(savedMessages.body.map((message: { role: string }) => message.role)).toEqual([
+      'USER',
+      'ASSISTANT',
+      'USER',
+      'ASSISTANT',
+    ]);
+    expect(savedMessages.body[1].citations[0]).toHaveProperty('pageNumber');
 
     const promptsBeforeDeniedQuery = llmPrompts.length;
     await request(server)
@@ -425,6 +580,264 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
           prompt.sources.every((source) => !source.documentName.includes('other-workspace-decoy')),
         ),
     ).toBe(true);
+
+    const evaluationQuestions = JSON.parse(
+      readFileSync(resolve(projectRoot, 'test/fixtures/rag-evaluation/questions.json'), 'utf8'),
+    ) as EvaluationQuestion[];
+    const evaluationResults = [];
+    let evaluationProfile: QueryResponse['retrievalDebug']['embeddingProfile'] | undefined;
+    for (const evaluationQuestion of evaluationQuestions) {
+      const evaluationResponse = await request(server)
+        .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/query`)
+        .set(ownerAuth)
+        .send({ question: evaluationQuestion.question, topK: 10, debug: true })
+        .expect(201);
+      const result = evaluationResponse.body as QueryResponse;
+      evaluationProfile ??= result.retrievalDebug.embeddingProfile;
+      evaluationResults.push(evaluateQuestionResult(evaluationQuestion, result));
+    }
+    const metrics = calculateMetrics(evaluationResults);
+    expect(metrics.questionCount).toBe(56);
+
+    const evaluationOutput = resolve(projectRoot, 'test/results/rag-acceptance-latest.json');
+    mkdirSync(resolve(projectRoot, 'test/results'), { recursive: true });
+    writeFileSync(
+      evaluationOutput,
+      `${JSON.stringify(
+        {
+          providerMode: 'deterministic-acceptance-stubs',
+          embeddingProfile: evaluationProfile,
+          metrics,
+          results: evaluationResults,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+  });
+
+  it('enforces OWNER, ADMIN, and MEMBER permissions through the shared policy guard', async () => {
+    if (!app) throw new Error('Nest test app was not initialized');
+    const server = app.getHttpServer();
+    const documentQueue = app.get<Queue>(getQueueToken(DOCUMENT_PROCESSING_QUEUE));
+    const suffix = `${process.pid}-${Date.now()}`;
+    const register = async (email: string, name: string) =>
+      request(server)
+        .post('/api/v1/auth/register')
+        .send({ email, password: 'acceptance-password', name })
+        .expect(201);
+
+    const ownerRegistration = await register(`permissions-owner-${suffix}@example.test`, 'Owner');
+    const ownerAuth = { Authorization: `Bearer ${ownerRegistration.body.accessToken}` };
+    const workspace = await request(server)
+      .post('/api/v1/workspaces')
+      .set(ownerAuth)
+      .send({ name: `Permissions ${suffix}` })
+      .expect(201);
+    const workspaceId = workspace.body.id as string;
+    const targetKb = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(ownerAuth)
+      .send({ name: 'Shared policy tests' })
+      .expect(201);
+    const knowledgeBaseId = targetKb.body.id as string;
+
+    const adminEmail = `permissions-admin-${suffix}@example.test`;
+    const ownerAdminInvite = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(ownerAuth)
+      .send({ email: adminEmail, role: 'ADMIN' })
+      .expect(201);
+    const wrongRegistration = await register(
+      `permissions-wrong-${suffix}@example.test`,
+      'Wrong user',
+    );
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set({ Authorization: `Bearer ${wrongRegistration.body.accessToken}` })
+      .send({ token: ownerAdminInvite.body.invitationToken })
+      .expect(403);
+    const adminRegistration = await register(adminEmail, 'Admin');
+    const adminAuth = { Authorization: `Bearer ${adminRegistration.body.accessToken}` };
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set(adminAuth)
+      .send({ token: ownerAdminInvite.body.invitationToken })
+      .expect(201);
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set(adminAuth)
+      .send({ token: ownerAdminInvite.body.invitationToken })
+      .expect(409);
+
+    const memberEmail = `permissions-member-${suffix}@example.test`;
+    const memberInvite = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(adminAuth)
+      .send({ email: memberEmail, role: 'MEMBER' })
+      .expect(201);
+    const memberRegistration = await register(memberEmail, 'Member');
+    const memberAuth = { Authorization: `Bearer ${memberRegistration.body.accessToken}` };
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set(memberAuth)
+      .send({ token: memberInvite.body.invitationToken })
+      .expect(201);
+
+    const membersResponse = await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/members`)
+      .set(ownerAuth)
+      .expect(200);
+    expect(membersResponse.body.map((member: { role: string }) => member.role).sort()).toEqual([
+      'ADMIN',
+      'MEMBER',
+      'OWNER',
+    ]);
+
+    const ownerDocument = await uploadMarkdown(
+      server,
+      ownerAuth,
+      knowledgeBaseId,
+      'owner-shared.md',
+      Buffer.from('所有者上传的共享测试资料。'),
+    );
+    const memberDocument = await uploadMarkdown(
+      server,
+      memberAuth,
+      knowledgeBaseId,
+      'member-owned.md',
+      Buffer.from('成员上传的团队查询测试资料。'),
+    );
+    await waitForDocumentsReady(
+      server,
+      ownerAuth,
+      [ownerDocument.id, memberDocument.id],
+      documentQueue,
+      workerErrors,
+    );
+
+    await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(memberAuth)
+      .expect(200);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(memberAuth)
+      .send({ name: 'Member cannot create this' })
+      .expect(403);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}`)
+      .set(memberAuth)
+      .send({ name: 'Member cannot rename this' })
+      .expect(403);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(memberAuth)
+      .send({ email: `blocked-${suffix}@example.test`, role: 'MEMBER' })
+      .expect(403);
+    await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(memberAuth)
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+      .set(memberAuth)
+      .send({ documentIds: [ownerDocument.id] })
+      .expect(403);
+    expect(await app.get(PrismaService).document.count({ where: { id: ownerDocument.id } })).toBe(
+      1,
+    );
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+      .set(memberAuth)
+      .send({ documentIds: [memberDocument.id] })
+      .expect(200);
+    const memberQuery = await request(server)
+      .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/query`)
+      .set(memberAuth)
+      .send({ question: '团队资料里有哪些信息？', topK: 3 })
+      .expect(201);
+    expect(memberQuery.body.knowledgeBaseId).toBe(knowledgeBaseId);
+
+    const adminKnowledgeBase = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(adminAuth)
+      .send({ name: 'Admin managed KB' })
+      .expect(201);
+    await request(server)
+      .patch(`/api/v1/knowledge-bases/${knowledgeBaseId}`)
+      .set(adminAuth)
+      .send({ description: 'Updated by admin' })
+      .expect(200);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(adminAuth)
+      .send({ email: `blocked-admin-${suffix}@example.test`, role: 'ADMIN' })
+      .expect(403);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(adminAuth)
+      .send({ role: 'ADMIN' })
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${ownerRegistration.body.user.id}`)
+      .set(adminAuth)
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${adminRegistration.body.user.id}`)
+      .set(adminAuth)
+      .expect(403);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}`)
+      .set(adminAuth)
+      .send({ name: 'Admin cannot rename this' })
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+      .set(adminAuth)
+      .send({ documentIds: [ownerDocument.id] })
+      .expect(200);
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${adminKnowledgeBase.body.id}`)
+      .set(adminAuth)
+      .expect(200);
+    await request(server).delete(`/api/v1/workspaces/${workspaceId}`).set(adminAuth).expect(403);
+
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(ownerAuth)
+      .send({ role: 'ADMIN' })
+      .expect(200);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(memberAuth)
+      .send({ name: 'Promoted member can manage KBs' })
+      .expect(201);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(ownerAuth)
+      .send({ role: 'MEMBER' })
+      .expect(200);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(adminAuth)
+      .expect(200);
+    await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/members`)
+      .set(memberAuth)
+      .expect(404);
+
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}`)
+      .set(ownerAuth)
+      .send({ name: 'Owner updated this workspace' })
+      .expect(200);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${ownerRegistration.body.user.id}`)
+      .set(ownerAuth)
+      .expect(403);
+    await request(server).delete(`/api/v1/workspaces/${workspaceId}`).set(ownerAuth).expect(200);
   });
 });
 
@@ -473,4 +886,19 @@ async function waitForDocumentsReady(
       `文档处理超时，仍未完成：${JSON.stringify(diagnostics)}；Worker 错误：${workerErrors.join(' | ') || '无'}`,
     );
   }
+}
+
+function fakeEmbedding(text: string): number[] {
+  if (text.includes('法国') || text.includes('巴黎')) return [1, 0, 0];
+  if (text.includes('上海') || text.includes('住宿') || text.includes('差旅')) return [0, 1, 0];
+  if (text.includes('安全') || text.includes('Git') || text.includes('API Key')) return [0, 0, 1];
+  return [0.57735027, 0.57735027, 0.57735027];
+}
+
+function fakeRerankScore(query: string, content: string): number {
+  if (query.includes('法国') && content.includes('巴黎是法国首都')) return 1;
+  if (query.includes('上海') && content.includes('600 元')) return 1;
+  const queryChars = [...new Set(Array.from(query.replace(/[\s，。？?]/gu, '')))];
+  const matches = queryChars.filter((character) => content.includes(character)).length;
+  return matches / Math.max(queryChars.length, 1);
 }

@@ -6,6 +6,7 @@ import * as Minio from 'minio';
 export class MinioService implements OnModuleInit {
   private readonly logger = new Logger(MinioService.name);
   private readonly client: Minio.Client;
+  private readonly signingClient: Minio.Client;
   private readonly bucket: string;
 
   constructor(config: ConfigService) {
@@ -15,6 +16,19 @@ export class MinioService implements OnModuleInit {
       endPoint: config.getOrThrow<string>('MINIO_ENDPOINT'),
       port: Number(config.getOrThrow<string>('MINIO_PORT')),
       useSSL: useSSL === true || useSSL === 'true',
+      accessKey: config.getOrThrow<string>('MINIO_ACCESS_KEY'),
+      secretKey: config.getOrThrow<string>('MINIO_SECRET_KEY'),
+    });
+    const publicUseSSL = config.get<string | boolean>('MINIO_PUBLIC_USE_SSL', useSSL ?? false);
+    this.signingClient = new Minio.Client({
+      endPoint: config.get<string>(
+        'MINIO_PUBLIC_ENDPOINT',
+        config.getOrThrow<string>('MINIO_ENDPOINT'),
+      ),
+      port: Number(
+        config.get<string>('MINIO_PUBLIC_PORT', config.getOrThrow<string>('MINIO_PORT')),
+      ),
+      useSSL: publicUseSSL === true || publicUseSSL === 'true',
       accessKey: config.getOrThrow<string>('MINIO_ACCESS_KEY'),
       secretKey: config.getOrThrow<string>('MINIO_SECRET_KEY'),
     });
@@ -47,5 +61,48 @@ export class MinioService implements OnModuleInit {
 
   getBucket(): string {
     return this.bucket;
+  }
+
+  signSingleUpload(objectKey: string, expiresSeconds: number): Promise<string> {
+    return this.signingClient.presignedPutObject(this.bucket, objectKey, expiresSeconds);
+  }
+
+  signMultipartPart(objectKey: string, uploadId: string, partNumber: number): Promise<string> {
+    return this.signingClient.presignedUrl('PUT', this.bucket, objectKey, 900, {
+      uploadId,
+      partNumber: String(partNumber),
+    });
+  }
+
+  initiateMultipart(objectKey: string, mimeType: string): Promise<string> {
+    return this.client.initiateNewMultipartUpload(this.bucket, objectKey, {
+      'Content-Type': mimeType,
+    });
+  }
+
+  completeMultipart(
+    objectKey: string,
+    uploadId: string,
+    parts: Array<{ part: number; etag?: string }>,
+  ) {
+    return this.client.completeMultipartUpload(this.bucket, objectKey, uploadId, parts);
+  }
+
+  listMultipartParts(
+    objectKey: string,
+    uploadId: string,
+  ): Promise<Array<{ part: number; etag: string; size: number }>> {
+    const client = this.client as unknown as {
+      listParts: (
+        bucketName: string,
+        objectName: string,
+        multipartUploadId: string,
+      ) => Promise<Array<{ part: number; etag: string; size: number }>>;
+    };
+    return client.listParts(this.bucket, objectKey, uploadId);
+  }
+
+  abortMultipart(objectKey: string, uploadId: string): Promise<void> {
+    return this.client.abortMultipartUpload(this.bucket, objectKey, uploadId);
   }
 }

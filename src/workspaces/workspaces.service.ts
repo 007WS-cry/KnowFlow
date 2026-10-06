@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../storage/minio.service';
@@ -45,22 +45,18 @@ export class WorkspacesService {
     });
   }
 
-  async getForUser(userId: string, workspaceId: string) {
-    const membership = await this.getMembership(userId, workspaceId);
-    return { ...membership.workspace, role: membership.role };
+  async get(workspaceId: string) {
+    return this.prisma.workspace.findUniqueOrThrow({ where: { id: workspaceId } });
   }
 
-  async update(userId: string, workspaceId: string, name: string) {
-    await this.assertOwner(userId, workspaceId);
-    const workspace = await this.prisma.workspace.update({
+  async update(workspaceId: string, name: string) {
+    return this.prisma.workspace.update({
       where: { id: workspaceId },
       data: { name: name.trim() },
     });
-    return { ...workspace, role: 'OWNER' as const };
   }
 
-  async delete(userId: string, workspaceId: string) {
-    await this.assertOwner(userId, workspaceId);
+  async delete(workspaceId: string) {
     const documents = await this.prisma.document.findMany({
       where: { knowledgeBase: { workspaceId } },
       select: { id: true, objectKey: true },
@@ -74,27 +70,5 @@ export class WorkspacesService {
     );
     await this.prisma.workspace.delete({ where: { id: workspaceId } });
     return { success: true as const, id: workspaceId };
-  }
-
-  async assertMember(userId: string, workspaceId: string) {
-    return (await this.getMembership(userId, workspaceId)).workspace;
-  }
-
-  async assertOwner(userId: string, workspaceId: string) {
-    const membership = await this.getMembership(userId, workspaceId);
-    if (membership.role !== 'OWNER') {
-      throw new ForbiddenException('只有 Workspace 所有者可以执行此操作');
-    }
-    return membership.workspace;
-  }
-
-  private async getMembership(userId: string, workspaceId: string) {
-    const membership = await this.prisma.workspaceMember.findUnique({
-      where: { workspaceId_userId: { workspaceId, userId } },
-      include: { workspace: true },
-    });
-
-    if (!membership) throw new NotFoundException('Workspace 不存在');
-    return membership;
   }
 }

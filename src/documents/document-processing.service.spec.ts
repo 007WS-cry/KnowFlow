@@ -1,6 +1,7 @@
-import { DocumentStatus } from '@prisma/client';
+import { DocumentProcessingStage, DocumentStatus } from '@prisma/client';
 import { Readable } from 'node:stream';
 import { EmbeddingService } from '../embeddings/embedding.service';
+import { EmbeddingIndexService } from '../embeddings/embedding-index.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../storage/minio.service';
 import { DocumentProcessingService } from './document-processing.service';
@@ -10,171 +11,142 @@ interface SqlQuery {
   values: unknown[];
 }
 
-function createHarness(content: string) {
-  let storedChunkCount = 0;
+function createHarness(
+  content: string,
+  options: { filename?: string; activeIndexVersion?: number; cancelOnCheck?: boolean } = {},
+) {
+  const stageUpdates: DocumentProcessingStage[] = [];
   const statusUpdates: DocumentStatus[] = [];
   const document = {
     id: 'document-1',
     knowledgeBaseId: 'kb-1',
-    originalName: 'notes.txt',
+    originalName: options.filename ?? 'notes.txt',
     objectKey: 'workspace-1/kb-1/notes.txt',
     status: DocumentStatus.PENDING,
+    processingStage: DocumentProcessingStage.QUEUED,
+    activeIndexVersion: options.activeIndexVersion ?? 0,
+    cancelRequested: false,
+  };
+  let findCount = 0;
+  const recordUpdate = (data: Record<string, unknown>) => {
+    if (data.status) statusUpdates.push(data.status as DocumentStatus);
+    if (data.processingStage) stageUpdates.push(data.processingStage as DocumentProcessingStage);
   };
   const prismaMock = {
     document: {
-      findUnique: jest.fn().mockResolvedValue(document),
-      updateMany: jest.fn(async ({ data }: { data: { status: DocumentStatus } }) => {
-        statusUpdates.push(data.status);
+      findUnique: jest.fn(async () => {
+        findCount += 1;
+        return {
+          ...document,
+          cancelRequested: options.cancelOnCheck && findCount > 1,
+        };
+      }),
+      updateMany: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
+        recordUpdate(data);
         return { count: 1 };
       }),
     },
-    chunk: {
-      deleteMany: jest.fn(async () => {
-        storedChunkCount = 0;
-        return { count: 0 };
+    chunk: { deleteMany: jest.fn().mockResolvedValue({ count: 0 }) },
+    $executeRaw: jest.fn().mockResolvedValue(1),
+    $transaction: jest.fn(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        document: {
+          updateMany: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
+            recordUpdate(data);
+            return { count: options.cancelOnCheck ? 0 : 1 };
+          }),
+        },
+        knowledgeBase: { update: jest.fn().mockResolvedValue({}) },
       }),
-    },
-    $executeRaw: jest.fn(async (query: SqlQuery) => {
-      storedChunkCount += query.values.length / 6;
-      return storedChunkCount;
-    }),
+    ),
   };
   const storageClient = {
     getObject: jest.fn(async () => Readable.from([Buffer.from(content)])),
   };
-  const storage = {
-    getClient: () => storageClient,
-    getBucket: () => 'knowflow-documents',
+  const storage = { getClient: () => storageClient, getBucket: () => 'knowflow-documents' };
+  const embeddingIndex = { ensureHnswIndex: jest.fn().mockResolvedValue(undefined) };
+  const embeddings = {
+    embedDocuments: jest.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3])),
+    toPgVector: jest.fn((vector: number[]) => `[${vector.join(',')}]`),
+    getProfile: jest.fn((dimension: number) => ({
+      provider: 'test',
+      model: 'test-model',
+      version: 'test-v1',
+      dimension,
+    })),
   };
-  const embeddings = new EmbeddingService();
   const service = new DocumentProcessingService(
     prismaMock as unknown as PrismaService,
     storage as unknown as MinioService,
-    embeddings,
+    embeddings as unknown as EmbeddingService,
+    embeddingIndex as unknown as EmbeddingIndexService,
   );
-
-  return {
-    service,
-    prismaMock,
-    storageClient,
-    statusUpdates,
-    getStoredChunkCount: () => storedChunkCount,
-    addStoredChunks: (count: number) => {
-      storedChunkCount += count;
-    },
-  };
+  return { service, prismaMock, storageClient, embeddingIndex, stageUpdates, statusUpdates };
 }
 
-describe('DocumentProcessingService', () => {
-  it('parses text, chunks it, persists 1536-dimension embeddings, and marks it ready', async () => {
-    const content = 'KnowFlow indexes useful team knowledge for retrieval.';
-    const harness = createHarness(content);
+describe('DocumentProcessingService staged structured indexing', () => {
+  it('persists structured Markdown metadata and activates a new index version', async () => {
+    const content = '# 员工手册\n\n## 请假制度\n\n员工每年可以申请年假。';
+    const harness = createHarness(content, { filename: 'handbook.md', activeIndexVersion: 2 });
     await harness.service.process('document-1');
 
     expect(harness.storageClient.getObject).toHaveBeenCalledWith(
       'knowflow-documents',
       'workspace-1/kb-1/notes.txt',
     );
-    expect(harness.prismaMock.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(harness.embeddingIndex.ensureHnswIndex).toHaveBeenCalledWith(3);
     const insert = harness.prismaMock.$executeRaw.mock.calls[0]![0] as SqlQuery;
-    expect(insert.sql).toContain('INSERT INTO "Chunk"');
-    expect(insert.values).toHaveLength(6);
+    expect(insert.sql).toContain('"documentIndexVersion"');
     expect(insert.values[1]).toBe('document-1');
-    expect(insert.values[2]).toBe(0);
-    expect(insert.values[3]).toBe(content);
-    expect(typeof insert.values[4]).toBe('string');
-    expect((insert.values[4] as string).slice(1, -1).split(',')).toHaveLength(1536);
-    expect(JSON.parse(insert.values[5] as string)).toEqual({ sourceName: 'notes.txt' });
-    expect(harness.getStoredChunkCount()).toBe(1);
+    expect(insert.values[2]).toBe(3);
+    expect(insert.values[4]).toContain('员工每年');
+    expect(JSON.parse(insert.values[10] as string)).toMatchObject({
+      sourceName: 'handbook.md',
+      headingPath: ['员工手册', '请假制度'],
+      paragraphStart: 1,
+    });
     expect(harness.statusUpdates).toEqual([DocumentStatus.PROCESSING, DocumentStatus.READY]);
+    expect(harness.stageUpdates).toEqual([
+      DocumentProcessingStage.PARSING,
+      DocumentProcessingStage.CHUNKING,
+      DocumentProcessingStage.EMBEDDING,
+      DocumentProcessingStage.EMBEDDING,
+      DocumentProcessingStage.INDEXING,
+      DocumentProcessingStage.COMPLETE,
+    ]);
+  });
+
+  it('records failure reason and leaves the active index untouched', async () => {
+    const harness = createHarness('   ');
+    await expect(harness.service.process('document-1')).rejects.toThrow(
+      '文档中没有可索引的文本内容',
+    );
+    expect(harness.statusUpdates.at(-1)).toBe(DocumentStatus.FAILED);
     expect(harness.prismaMock.document.updateMany).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        where: { id: 'document-1' },
         data: expect.objectContaining({
-          status: DocumentStatus.READY,
-          processedAt: expect.any(Date),
+          status: DocumentStatus.FAILED,
+          errorMessage: expect.any(String),
         }),
       }),
     );
+    expect(harness.prismaMock.$executeRaw).not.toHaveBeenCalled();
   });
 
-  it('marks empty or unreadable documents failed and leaves no chunks', async () => {
-    const empty = createHarness(' \n  ');
-    await expect(empty.service.process('document-1')).rejects.toThrow('文档中没有可索引的文本内容');
-    expect(empty.statusUpdates.at(-1)).toBe(DocumentStatus.FAILED);
-    expect(empty.getStoredChunkCount()).toBe(0);
-    expect(empty.prismaMock.$executeRaw).not.toHaveBeenCalled();
-
-    const unreadable = createHarness('irrelevant');
-    unreadable.storageClient.getObject.mockRejectedValueOnce(new Error('MinIO read failed'));
-    await expect(unreadable.service.process('document-1')).rejects.toThrow('MinIO read failed');
-    expect(unreadable.statusUpdates.at(-1)).toBe(DocumentStatus.FAILED);
-    expect(unreadable.getStoredChunkCount()).toBe(0);
-  });
-
-  it('cleans up chunks and marks the document failed when embedding persistence fails', async () => {
+  it('removes the staging version when vector persistence fails so retry can start cleanly', async () => {
     const harness = createHarness('Persist this embedding.');
     harness.prismaMock.$executeRaw.mockRejectedValueOnce(new Error('pgvector write failed'));
-
     await expect(harness.service.process('document-1')).rejects.toThrow('pgvector write failed');
-    expect(harness.prismaMock.chunk.deleteMany).toHaveBeenCalledTimes(2);
-    expect(harness.getStoredChunkCount()).toBe(0);
-    expect(harness.statusUpdates.at(-1)).toBe(DocumentStatus.FAILED);
-  });
-
-  it('removes already inserted batches when a later worker batch fails', async () => {
-    const harness = createHarness('x'.repeat(209_200));
-    let insertCalls = 0;
-    let chunksBeforeFailure = 0;
-    harness.prismaMock.$executeRaw.mockImplementation(async (statement: SqlQuery) => {
-      insertCalls += 1;
-      const batchSize = statement.values.length / 6;
-      if (insertCalls === 2) {
-        chunksBeforeFailure = harness.getStoredChunkCount();
-        throw new Error('second chunk batch failed');
-      }
-      harness.addStoredChunks(batchSize);
-      return batchSize;
+    expect(harness.prismaMock.chunk.deleteMany).toHaveBeenCalledWith({
+      where: { documentId: 'document-1', documentIndexVersion: 1 },
     });
-
-    await expect(harness.service.process('document-1')).rejects.toThrow(
-      'second chunk batch failed',
-    );
-    expect(insertCalls).toBe(2);
-    expect(chunksBeforeFailure).toBe(200);
-    expect(harness.getStoredChunkCount()).toBe(0);
     expect(harness.statusUpdates.at(-1)).toBe(DocumentStatus.FAILED);
   });
 
-  it('retries idempotently when final status persistence fails after 20 chunks were written', async () => {
-    const harness = createHarness('x'.repeat(20_960));
-    let failFirstReadyUpdate = true;
-    const chunksAtReady = harness.statusUpdates;
-    harness.prismaMock.document.updateMany.mockImplementation(
-      async ({ data }: { data: { status: DocumentStatus } }) => {
-        if (data.status === DocumentStatus.READY) {
-          chunksAtReady.push(data.status);
-          if (failFirstReadyUpdate) {
-            failFirstReadyUpdate = false;
-            expect(harness.getStoredChunkCount()).toBe(20);
-            throw new Error('ready status write failed');
-          }
-        } else {
-          chunksAtReady.push(data.status);
-        }
-        return { count: 1 };
-      },
-    );
-
-    await expect(harness.service.process('document-1')).rejects.toThrow(
-      'ready status write failed',
-    );
-    expect(harness.getStoredChunkCount()).toBe(0);
-    expect(harness.statusUpdates.at(-1)).toBe(DocumentStatus.FAILED);
-
+  it('stops between processing stages when cancellation is requested', async () => {
+    const harness = createHarness('This task will be cancelled.', { cancelOnCheck: true });
     await harness.service.process('document-1');
-    expect(harness.getStoredChunkCount()).toBe(20);
-    expect(harness.prismaMock.$executeRaw).toHaveBeenCalledTimes(2);
-    expect(chunksAtReady.filter((status) => status === DocumentStatus.READY)).toHaveLength(2);
+    expect(harness.statusUpdates.at(-1)).toBe(DocumentStatus.CANCELLED);
+    expect(harness.prismaMock.$executeRaw).not.toHaveBeenCalled();
   });
 });

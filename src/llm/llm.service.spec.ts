@@ -63,4 +63,45 @@ describe('LlmService', () => {
     fetchMock.mockResolvedValueOnce(new Response('provider error', { status: 503 }));
     await expect(service.generateAnswer('Question?', [])).rejects.toThrow('HTTP 503');
   });
+
+  it('streams OpenAI-compatible deltas and forwards the caller cancellation signal', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\ndata: {"choices":[{"delta":{"content":"team"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    );
+    const deltas: string[] = [];
+    await service.streamAnswer(
+      'Question?',
+      [
+        {
+          citation: 1,
+          documentName: 'source.md',
+          chunkIndex: 2,
+          content: 'Source',
+          pageNumber: 12,
+          headingPath: ['Policy'],
+        },
+      ],
+      [{ role: 'USER', content: 'Earlier question' }],
+      new AbortController().signal,
+      (delta) => deltas.push(delta),
+    );
+    expect(deltas).toEqual(['Hello ', 'team']);
+    const [, request] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(request.body as string) as {
+      stream: boolean;
+      messages: Array<{ content: string }>;
+    };
+    expect(payload.stream).toBe(true);
+    expect(payload.messages).toHaveLength(3);
+    expect(payload.messages.at(-1)?.content).toContain('"pageNumber":12');
+
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(
+      service.streamAnswer('Question?', [], [], cancelled.signal, () => undefined),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+  });
 });

@@ -143,6 +143,8 @@ button { -webkit-tap-highlight-color: transparent; }
 .topbar-context strong { color: #565c72; font-weight: 600; }
 .topbar-actions { display: flex; align-items: center; gap: 12px; }
 .topbar-actions .el-button { color: #9297aa; }
+.topbar-actions .team-members-topbar-button { display: inline-flex; gap: 7px; color: #646a80; }
+.team-members-topbar-button .el-tag { margin-left: 2px; font-size: 9px; }
 .connection-indicator { display: flex; align-items: center; gap: 6px; padding-right: 15px; color: #8c92a6; border-right: 1px solid #e9ebf2; font-size: 10px; }
 .connection-indicator i { width: 6px; height: 6px; background: #5cc89a; border-radius: 50%; box-shadow: 0 0 0 3px rgba(92,200,154,.12); }
 .main-load-error { padding: 18px 32px 0; }
@@ -234,6 +236,13 @@ button { -webkit-tap-highlight-color: transparent; }
 .file-name-wrap strong { max-width: 350px; color: #484d63; font-size: 10px; font-weight: 600; }
 .file-name-wrap small { margin-top: 4px; color: #9b9fb0; font-size: 9px; }
 .document-table .el-tag { border: none; font-size: 9px; }
+.task-progress { display: grid; gap: 4px; max-width: 145px; margin-top: 5px; }
+.task-progress small { color: #858ba0; font-size: 8px; }
+.task-progress progress { width: 100%; height: 5px; overflow: hidden; appearance: none; border: 0; border-radius: 5px; background: #eeeff5; }
+.task-progress progress::-webkit-progress-bar { background: #eeeff5; border-radius: 5px; }
+.task-progress progress::-webkit-progress-value { background: linear-gradient(90deg, #8a82f0, #5a52d8); border-radius: 5px; transition: width .2s ease; }
+.task-progress progress::-moz-progress-bar { background: linear-gradient(90deg, #8a82f0, #5a52d8); border-radius: 5px; }
+.document-task-actions { display: flex; flex-wrap: wrap; align-items: center; }
 .muted-text { color: #8c92a5; font-size: 9px; }
 .empty-documents { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 25px 0 27px; color: #9a9fb0; }
 .empty-icon { display: grid; place-items: center; width: 42px; height: 42px; margin-bottom: 3px; color: #8982ea; background: #f3f2ff; border-radius: 13px; font-size: 18px; }
@@ -249,6 +258,11 @@ button { -webkit-tap-highlight-color: transparent; }
 .ask-intro h2 { margin: 0 0 4px; color: #454a64; font-size: 12px; font-weight: 700; }
 .ask-intro p { margin: 0; color: #858ba2; font-size: 10px; }
 .conversation-list { flex: 1; min-height: 150px; padding: 14px 9px; overflow-y: auto; }
+.conversation-toolbar { display: flex; align-items: center; min-height: 38px; padding: 8px 2px 0; }
+.conversation-history-list { display: flex; align-items: center; gap: 6px; width: 100%; overflow-x: auto; }
+.conversation-history-item { max-width: 190px; overflow: hidden; padding: 6px 9px; color: #777d92; background: #fff; border: 1px solid #e9eaf1; border-radius: 7px; cursor: pointer; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-history-item:hover, .conversation-history-item.active { color: #5d56cf; background: #f4f3ff; border-color: #dad8fb; }
+.conversation-history-empty { color: #a1a6b4; font-size: 9px; }
 .conversation-empty { display: flex; flex-direction: column; align-items: center; padding: clamp(24px, 7vh, 70px) 20px 25px; color: #9a9fb0; text-align: center; }
 .suggestion-icon { display: grid; place-items: center; width: 42px; height: 42px; margin-bottom: 12px; color: #6b63df; background: #f1f0ff; border-radius: 14px; font-size: 18px; }
 .conversation-empty strong { margin-bottom: 6px; color: #5e6379; font-size: 12px; }
@@ -283,6 +297,34 @@ button { -webkit-tap-highlight-color: transparent; }
 .composer-footer > span .el-icon { font-size: 11px; }
 .composer-footer .el-button { height: 31px; padding: 0 12px; border-radius: 8px; font-size: 10px; }
 .composer-footer .el-button .el-icon { margin-left: 6px; }
+
+/* Workspace team management */
+.workspace-members-dialog { min-height: 180px; }
+.members-summary { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; padding: 14px; background: #f7f7fc; border: 1px solid #eeeff6; border-radius: 12px; }
+.members-summary-icon { display: grid; place-items: center; width: 38px; height: 38px; color: var(--brand); background: var(--brand-soft); border-radius: 11px; font-size: 17px; }
+.members-summary > span:nth-child(2) { display: grid; gap: 3px; flex: 1; }
+.members-summary strong { color: var(--ink); font-size: 13px; }
+.members-summary small { color: var(--muted); font-size: 11px; }
+.member-invite-form { margin: 0 0 20px; padding: 15px 16px 12px; background: #fcfcff; border: 1px solid #eeeff6; border-radius: 12px; }
+.member-invite-form .el-form-item { margin-bottom: 0; }
+.member-invite-form .el-form-item__content { display: block; }
+.invite-fields { display: flex; width: 100%; gap: 8px; }
+.invite-fields > .el-input { flex: 1; }
+.invite-role-select { width: 145px; }
+.member-invite-hint { margin-top: 8px; color: var(--muted); font-size: 10px; }
+.invitation-link-box { display: flex; gap: 8px; margin-top: 11px; }
+.member-table-heading { display: flex; align-items: baseline; gap: 8px; margin: 16px 0 9px; }
+.member-table-heading h3 { margin: 0; color: var(--ink); font-size: 13px; }
+.member-table-heading > span { color: var(--muted); font-size: 10px; }
+.invitations-heading { margin-top: 23px; }
+.member-identity { display: flex; align-items: center; gap: 9px; }
+.member-identity > span:nth-child(2) { display: grid; gap: 2px; min-width: 0; }
+.member-identity strong { overflow: hidden; color: var(--ink); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.member-identity small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.member-avatar { display: grid; place-items: center; flex: 0 0 auto; width: 28px; height: 28px; color: #5b55c4; background: #eeedff; border-radius: 50%; font-size: 11px; font-weight: 700; }
+.workspace-members-dialog .el-table .cell { padding-left: 10px; padding-right: 10px; }
+.workspace-members-dialog .el-empty { padding: 10px 0; }
+.document-table .el-table-column--selection .cell { padding-left: 12px; padding-right: 8px; }
 
 @media (max-width: 950px) {
   .sidebar { flex-basis: 220px; width: 220px; }
@@ -322,6 +364,13 @@ button { -webkit-tap-highlight-color: transparent; }
   .topbar { height: 43px; min-height: 43px; padding: 0 16px; }
   .topbar-context { gap: 6px; font-size: 9px; }
   .connection-indicator { font-size: 9px; }
+  .team-members-topbar-button { gap: 3px !important; padding: 4px !important; font-size: 9px; }
+  .team-members-topbar-button .el-tag { display: none; }
+  .topbar-actions { gap: 5px; }
+  .invite-fields { flex-wrap: wrap; }
+  .invite-fields > .el-input { flex-basis: 100%; }
+  .invite-role-select { flex: 1; width: auto; }
+  .invitation-link-box { flex-direction: column; }
   .welcome-view { width: calc(100% - 36px); min-height: calc(100vh - 210px); padding: 43px 0 16px; }
   .welcome-copy h1 { max-width: 320px; font-size: 29px; }
   .welcome-copy > p:not(.eyebrow) { max-width: 330px; font-size: 11px; }

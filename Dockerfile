@@ -1,6 +1,6 @@
-FROM node:22-alpine AS build
+FROM node:22-slim AS build
 
-RUN apk add --no-cache openssl
+RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV DATABASE_URL=postgresql://knowflow:build_only@127.0.0.1:5432/knowflow?schema=public
 COPY package*.json ./
@@ -9,9 +9,9 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS production-dependencies
+FROM node:22-slim AS production-dependencies
 
-RUN apk add --no-cache openssl
+RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV DATABASE_URL=postgresql://knowflow:build_only@127.0.0.1:5432/knowflow?schema=public
 COPY package*.json ./
@@ -19,9 +19,9 @@ COPY prisma ./prisma
 RUN npm ci --omit=dev
 RUN npx prisma generate
 
-FROM node:22-alpine AS runtime
+FROM node:22-slim AS runtime
 
-RUN apk add --no-cache openssl
+RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production
 WORKDIR /app
 

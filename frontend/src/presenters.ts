@@ -13,6 +13,7 @@ export function statusText(status: DocumentStatus): string {
     PROCESSING: '处理中',
     READY: '已就绪',
     FAILED: '处理失败',
+    CANCELLED: '已取消',
   }[status];
 }
 
@@ -22,8 +23,21 @@ export function statusType(status: DocumentStatus): 'info' | 'warning' | 'succes
     PROCESSING: 'warning',
     READY: 'success',
     FAILED: 'danger',
+    CANCELLED: 'info',
   };
   return types[status];
+}
+
+export function stageText(stage: string): string {
+  return {
+    UPLOAD: '上传中',
+    QUEUED: '排队中',
+    PARSING: '解析中',
+    CHUNKING: '结构化切块',
+    EMBEDDING: '生成向量',
+    INDEXING: '写入索引',
+    COMPLETE: '已完成',
+  }[stage] ?? stage;
 }
 
 export function formatDate(value: string): string {

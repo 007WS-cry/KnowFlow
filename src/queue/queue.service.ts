@@ -10,12 +10,12 @@ export class QueueService {
     private readonly documentQueue: Queue,
   ) {}
 
-  async enqueueDocumentProcessing(documentId: string): Promise<string> {
+  async enqueueDocumentProcessing(documentId: string, retryCount = 0): Promise<string> {
     const job = await this.documentQueue.add(
       'process-document',
       { documentId },
       {
-        jobId: documentId,
+        jobId: `${documentId}-r${retryCount}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 1_000 },
         removeOnComplete: { count: 1_000 },
@@ -26,13 +26,21 @@ export class QueueService {
     return job.id ?? documentId;
   }
 
-  async cancelDocumentProcessing(documentId: string): Promise<void> {
+  async cancelDocumentProcessing(documentId: string): Promise<boolean> {
     try {
-      const job = await this.documentQueue.getJob(documentId);
-      if (!job || (await job.getState()) === 'active') return;
-      await job.remove();
+      const jobs = await this.documentQueue.getJobs(
+        ['waiting', 'active', 'delayed', 'paused'],
+        0,
+        -1,
+        true,
+      );
+      const matchingJobs = jobs.filter((job) => job.data?.documentId === documentId);
+      if (matchingJobs.some((job) => job.processedOn && !job.finishedOn)) return false;
+      await Promise.all(matchingJobs.map((job) => job.remove()));
+      return true;
     } catch {
       // Deletion should still succeed if Redis is temporarily unavailable.
+      return false;
     }
   }
 }

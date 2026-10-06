@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, formatDate, statusText, statusType } from './presenters';
+import { formatBytes, formatDate, stageText, statusText, statusType } from './presenters';
 
 describe('document presentation helpers', () => {
   it('formats file sizes at readable units', () => {
@@ -18,6 +18,8 @@ describe('document presentation helpers', () => {
     expect(statusType('READY')).toBe('success');
     expect(statusText('FAILED')).toBe('处理失败');
     expect(statusType('FAILED')).toBe('danger');
+    expect(statusText('CANCELLED')).toBe('已取消');
+    expect(stageText('EMBEDDING')).toBe('生成向量');
   });
 
   it('returns a safe placeholder for invalid dates', () => {
