@@ -21,14 +21,14 @@ enum DocumentStatus {
 }
 
 model User {
-  id              String            @id @default(cuid())
-  email           String            @unique
-  name            String?
-  passwordHash    String?
-  createdAt       DateTime          @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime          @updatedAt @db.Timestamptz(6)
+  id               String            @id @default(cuid())
+  email            String            @unique
+  name             String?
+  passwordHash     String?
+  createdAt        DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime          @updatedAt @db.Timestamptz(6)
   workspaceMembers WorkspaceMember[]
-  sessions        Session[]
+  sessions         Session[]
 }
 
 model Session {
@@ -43,13 +43,13 @@ model Session {
 }
 
 model Workspace {
-  id               String            @id @default(cuid())
-  name             String
-  slug             String            @unique
-  createdAt        DateTime          @default(now()) @db.Timestamptz(6)
-  updatedAt        DateTime          @updatedAt @db.Timestamptz(6)
-  members          WorkspaceMember[]
-  knowledgeBases   KnowledgeBase[]
+  id             String            @id @default(cuid())
+  name           String
+  slug           String            @unique
+  createdAt      DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime          @updatedAt @db.Timestamptz(6)
+  members        WorkspaceMember[]
+  knowledgeBases KnowledgeBase[]
 }
 
 model WorkspaceMember {
@@ -72,7 +72,7 @@ model KnowledgeBase {
   description String?
   createdAt   DateTime   @default(now()) @db.Timestamptz(6)
   updatedAt   DateTime   @updatedAt @db.Timestamptz(6)
-  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   documents   Document[]
 
   @@unique([workspaceId, name])
@@ -98,14 +98,18 @@ model Document {
 }
 
 model Chunk {
-  id         String   @id @default(cuid())
-  documentId String
-  chunkIndex Int
-  content    String
-  embedding  Unsupported("vector(1536)")?
-  metadata   Json?    @db.JsonB
-  createdAt  DateTime @default(now()) @db.Timestamptz(6)
-  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  id                 String                 @id @default(cuid())
+  documentId         String
+  chunkIndex         Int
+  content            String
+  embedding          Unsupported("vector")?
+  embeddingProvider  String?
+  embeddingModel     String?
+  embeddingVersion   String?
+  embeddingDimension Int?
+  metadata           Json?                  @db.JsonB
+  createdAt          DateTime               @default(now()) @db.Timestamptz(6)
+  document           Document               @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
   @@unique([documentId, chunkIndex])
   @@index([documentId])

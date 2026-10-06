@@ -1,6 +1,7 @@
 import { DocumentStatus } from '@prisma/client';
 import { Readable } from 'node:stream';
 import { EmbeddingService } from '../embeddings/embedding.service';
+import { EmbeddingIndexService } from '../embeddings/embedding-index.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../storage/minio.service';
 import { DocumentProcessingService } from './document-processing.service';
@@ -35,7 +36,7 @@ function createHarness(content: string) {
       }),
     },
     $executeRaw: jest.fn(async (query: SqlQuery) => {
-      storedChunkCount += query.values.length / 6;
+      storedChunkCount += query.values.length / 10;
       return storedChunkCount;
     }),
   };
@@ -46,17 +47,29 @@ function createHarness(content: string) {
     getClient: () => storageClient,
     getBucket: () => 'knowflow-documents',
   };
-  const embeddings = new EmbeddingService();
+  const embeddingIndex = { ensureHnswIndex: jest.fn().mockResolvedValue(undefined) };
+  const embeddings = {
+    embedDocuments: jest.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3])),
+    toPgVector: jest.fn((vector: number[]) => `[${vector.join(',')}]`),
+    getProfile: jest.fn((dimension: number) => ({
+      provider: 'test',
+      model: 'test-model',
+      version: 'test-v1',
+      dimension,
+    })),
+  };
   const service = new DocumentProcessingService(
     prismaMock as unknown as PrismaService,
     storage as unknown as MinioService,
-    embeddings,
+    embeddings as unknown as EmbeddingService,
+    embeddingIndex as unknown as EmbeddingIndexService,
   );
 
   return {
     service,
     prismaMock,
     storageClient,
+    embeddingIndex,
     statusUpdates,
     getStoredChunkCount: () => storedChunkCount,
     addStoredChunks: (count: number) => {
@@ -66,7 +79,7 @@ function createHarness(content: string) {
 }
 
 describe('DocumentProcessingService', () => {
-  it('parses text, chunks it, persists 1536-dimension embeddings, and marks it ready', async () => {
+  it('parses text, chunks it, persists model-profiled embeddings, and marks it ready', async () => {
     const content = 'KnowFlow indexes useful team knowledge for retrieval.';
     const harness = createHarness(content);
     await harness.service.process('document-1');
@@ -76,15 +89,17 @@ describe('DocumentProcessingService', () => {
       'workspace-1/kb-1/notes.txt',
     );
     expect(harness.prismaMock.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(harness.embeddingIndex.ensureHnswIndex).toHaveBeenCalledWith(3);
     const insert = harness.prismaMock.$executeRaw.mock.calls[0]![0] as SqlQuery;
     expect(insert.sql).toContain('INSERT INTO "Chunk"');
-    expect(insert.values).toHaveLength(6);
+    expect(insert.values).toHaveLength(10);
     expect(insert.values[1]).toBe('document-1');
     expect(insert.values[2]).toBe(0);
     expect(insert.values[3]).toBe(content);
     expect(typeof insert.values[4]).toBe('string');
-    expect((insert.values[4] as string).slice(1, -1).split(',')).toHaveLength(1536);
-    expect(JSON.parse(insert.values[5] as string)).toEqual({ sourceName: 'notes.txt' });
+    expect((insert.values[4] as string).slice(1, -1).split(',')).toHaveLength(3);
+    expect(insert.values.slice(5, 9)).toEqual(['test', 'test-model', 'test-v1', 3]);
+    expect(JSON.parse(insert.values[9] as string)).toEqual({ sourceName: 'notes.txt' });
     expect(harness.getStoredChunkCount()).toBe(1);
     expect(harness.statusUpdates).toEqual([DocumentStatus.PROCESSING, DocumentStatus.READY]);
     expect(harness.prismaMock.document.updateMany).toHaveBeenLastCalledWith(
@@ -128,7 +143,7 @@ describe('DocumentProcessingService', () => {
     let chunksBeforeFailure = 0;
     harness.prismaMock.$executeRaw.mockImplementation(async (statement: SqlQuery) => {
       insertCalls += 1;
-      const batchSize = statement.values.length / 6;
+      const batchSize = statement.values.length / 10;
       if (insertCalls === 2) {
         chunksBeforeFailure = harness.getStoredChunkCount();
         throw new Error('second chunk batch failed');

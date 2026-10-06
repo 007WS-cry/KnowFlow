@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../storage/minio.service';
 import { EmbeddingService } from '../embeddings/embedding.service';
+import { EmbeddingIndexService } from '../embeddings/embedding-index.service';
 
 const CHUNK_SIZE = 1_200;
 const CHUNK_OVERLAP = 160;
@@ -20,6 +21,7 @@ export class DocumentProcessingService {
     private readonly prisma: PrismaService,
     private readonly storage: MinioService,
     private readonly embeddings: EmbeddingService,
+    private readonly embeddingIndex: EmbeddingIndexService,
   ) {}
 
   async process(documentId: string): Promise<void> {
@@ -90,8 +92,7 @@ export class DocumentProcessingService {
 
   private splitText(input: string): string[] {
     // PostgreSQL TEXT cannot store U+0000.
-    // eslint-disable-next-line no-control-regex
-    const text = input.replace(/\u0000/g, '').replace(/\r\n?/g, '\n').trim();
+    const text = input.replaceAll('\u0000', '').replace(/\r\n?/g, '\n').trim();
     if (!text) return [];
 
     const chunks: string[] = [];
@@ -112,20 +113,26 @@ export class DocumentProcessingService {
     return chunks;
   }
 
-  private async insertChunks(documentId: string, filename: string, chunks: string[]): Promise<void> {
+  private async insertChunks(
+    documentId: string,
+    filename: string,
+    chunks: string[],
+  ): Promise<void> {
     for (let offset = 0; offset < chunks.length; offset += INSERT_BATCH_SIZE) {
       const batch = chunks.slice(offset, offset + INSERT_BATCH_SIZE);
-      const vectors = await Promise.all(batch.map((content) => this.embeddings.embed(content)));
+      const vectors = await this.embeddings.embedDocuments(batch);
+      await this.embeddingIndex.ensureHnswIndex(vectors[0]!.length);
       const values = batch.map((content, batchIndex) => {
         const chunkIndex = offset + batchIndex;
         const vector = this.embeddings.toPgVector(vectors[batchIndex]!);
+        const profile = this.embeddings.getProfile(vectors[batchIndex]!.length);
         const metadata = JSON.stringify({ sourceName: filename });
 
-        return Prisma.sql`(${randomUUID()}, ${documentId}, ${chunkIndex}, ${content}, ${vector}::vector, ${metadata}::jsonb, NOW())`;
+        return Prisma.sql`(${randomUUID()}, ${documentId}, ${chunkIndex}, ${content}, ${vector}::vector, ${profile.provider}, ${profile.model}, ${profile.version}, ${profile.dimension}, ${metadata}::jsonb, NOW())`;
       });
 
       await this.prisma.$executeRaw(Prisma.sql`
-        INSERT INTO "Chunk" ("id", "documentId", "chunkIndex", "content", "embedding", "metadata", "createdAt")
+        INSERT INTO "Chunk" ("id", "documentId", "chunkIndex", "content", "embedding", "embeddingProvider", "embeddingModel", "embeddingVersion", "embeddingDimension", "metadata", "createdAt")
         VALUES ${Prisma.join(values)}
       `);
     }

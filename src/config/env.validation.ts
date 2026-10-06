@@ -32,4 +32,29 @@ export const envValidationSchema = Joi.object({
     .default('https://api.openai.com/v1'),
   LLM_API_KEY: Joi.string().allow('').default(''),
   LLM_MODEL: Joi.string().min(1).default('gpt-4o-mini'),
+
+  EMBEDDING_PROVIDER: Joi.string().valid('openai-compatible', 'local').default('openai-compatible'),
+  EMBEDDING_BASE_URL: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .default('https://api.openai.com/v1'),
+  EMBEDDING_API_KEY: Joi.string().allow('').default(''),
+  EMBEDDING_MODEL: Joi.string().min(1).default('text-embedding-3-small'),
+  EMBEDDING_VERSION: Joi.string().min(1).default('1'),
+  EMBEDDING_QUERY_PREFIX: Joi.string().allow('').default(''),
+  EMBEDDING_DOCUMENT_PREFIX: Joi.string().allow('').default(''),
+  EMBEDDING_DIMENSIONS: Joi.number().integer().min(1).max(2000).allow('').optional(),
+  EMBEDDING_LOCAL_MODEL_PATH: Joi.when('EMBEDDING_PROVIDER', {
+    is: 'local',
+    then: Joi.string().min(1).required(),
+    otherwise: Joi.string().allow('').default(''),
+  }),
+
+  RERANKER_PROVIDER: Joi.string().valid('compatible', 'disabled').default('compatible'),
+  RERANKER_BASE_URL: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .default('http://localhost:8001/v1'),
+  RERANKER_API_KEY: Joi.string().allow('').default(''),
+  RERANKER_MODEL: Joi.string().min(1).default('BAAI/bge-reranker-v2-m3'),
+  RAG_RECALL_CANDIDATE_LIMIT: Joi.number().integer().min(10).max(200).default(50),
+  RAG_RERANK_CANDIDATE_LIMIT: Joi.number().integer().min(10).max(200).default(50),
 });

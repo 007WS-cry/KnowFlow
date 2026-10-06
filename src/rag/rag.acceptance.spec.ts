@@ -6,7 +6,7 @@ import { Queue } from 'bullmq';
 import { AddressInfo } from 'node:net';
 import { createServer, Server } from 'node:http';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse as parseEnv } from 'dotenv';
 import request from 'supertest';
@@ -15,6 +15,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { QueueService } from '../queue/queue.service';
 import { DOCUMENT_PROCESSING_QUEUE } from '../queue/queue.constants';
 import { DocumentProcessor } from '../documents/document-processor';
+import {
+  calculateMetrics,
+  evaluateQuestionResult,
+  EvaluationQuestion,
+  QueryResponse,
+} from './evaluation/run-evaluation';
 
 interface PromptSource {
   citation: number;
@@ -72,18 +78,26 @@ function parsePrompt(body: string): { question: string; sources: PromptSource[] 
   return JSON.parse(userMessage.content) as { question: string; sources: PromptSource[] };
 }
 
-function fakeAnswer(sources: PromptSource[]): string {
-  const paris = sources.find((source) => source.content.includes('巴黎是法国首都'));
+function fakeAnswer(question: string, sources: PromptSource[]): string {
+  const paris =
+    question.includes('法国') &&
+    sources.find((source) => source.content.includes('巴黎是法国首都'));
   if (paris) return `巴黎是法国首都。[${paris.citation}]`;
 
-  const travel = sources.find(
-    (source) => source.content.includes('北京、上海、深圳') && source.content.includes('600 元'),
-  );
+  const travel =
+    question.includes('上海') &&
+    sources.find(
+      (source) => source.content.includes('北京、上海、深圳') && source.content.includes('600 元'),
+    );
   if (travel) return `北京、上海、深圳住宿上限为每晚 600 元。[${travel.citation}]`;
 
-  const lyon = sources.find((source) => source.content.includes('法国首都是里昂'));
+  const lyon =
+    question.includes('法国') &&
+    sources.find((source) => source.content.includes('法国首都是里昂'));
   if (lyon) return `隔离知识库中的资料写明法国首都是里昂。[${lyon.citation}]`;
 
+  const first = sources[0];
+  if (first) return `${first.content.slice(0, 160)} [${first.citation}]`;
   return '提供的知识来源中没有足够信息回答这个问题。';
 }
 
@@ -131,19 +145,43 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
 
     llmServer = createServer((incoming, outgoing) => {
       const bodyChunks: Buffer[] = [];
+      const requestPath = incoming.url ?? '';
       incoming.on('data', (chunk: Buffer | string) => {
         bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
       incoming.on('end', () => {
         try {
-          const prompt = parsePrompt(Buffer.concat(bodyChunks).toString('utf8'));
-          llmPrompts.push(prompt);
+          const body = JSON.parse(Buffer.concat(bodyChunks).toString('utf8')) as Record<
+            string,
+            unknown
+          >;
           outgoing.writeHead(200, { 'Content-Type': 'application/json' });
-          outgoing.end(
-            JSON.stringify({
-              choices: [{ message: { content: fakeAnswer(prompt.sources) } }],
-            }),
-          );
+          if (requestPath.endsWith('/embeddings')) {
+            const input = body.input as string[];
+            outgoing.end(
+              JSON.stringify({
+                data: input.map((text, index) => ({ index, embedding: fakeEmbedding(text) })),
+              }),
+            );
+          } else if (requestPath.endsWith('/rerank')) {
+            const query = String(body.query ?? '');
+            const documents = body.documents as string[];
+            const results = documents
+              .map((text, index) => ({ index, relevance_score: fakeRerankScore(query, text) }))
+              .sort((left, right) => right.relevance_score - left.relevance_score);
+            outgoing.end(JSON.stringify({ results }));
+          } else if (requestPath.endsWith('/chat/completions')) {
+            const prompt = parsePrompt(Buffer.concat(bodyChunks).toString('utf8'));
+            llmPrompts.push(prompt);
+            outgoing.end(
+              JSON.stringify({
+                choices: [{ message: { content: fakeAnswer(prompt.question, prompt.sources) } }],
+              }),
+            );
+          } else {
+            outgoing.writeHead(404);
+            outgoing.end(JSON.stringify({ error: 'unknown test endpoint' }));
+          }
         } catch {
           outgoing.writeHead(400, { 'Content-Type': 'application/json' });
           outgoing.end(JSON.stringify({ error: 'invalid test prompt' }));
@@ -161,6 +199,16 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     setTestEnvironment('LLM_BASE_URL', `http://127.0.0.1:${llmPort}/v1`);
     setTestEnvironment('LLM_API_KEY', 'local-acceptance-test-key');
     setTestEnvironment('LLM_MODEL', 'acceptance-test-model');
+    setTestEnvironment('EMBEDDING_PROVIDER', 'openai-compatible');
+    setTestEnvironment('EMBEDDING_BASE_URL', `http://127.0.0.1:${llmPort}/v1`);
+    setTestEnvironment('EMBEDDING_API_KEY', 'local-acceptance-test-key');
+    setTestEnvironment('EMBEDDING_MODEL', 'acceptance-embedding-model');
+    setTestEnvironment('EMBEDDING_VERSION', 'acceptance-v1');
+    setTestEnvironment('EMBEDDING_DIMENSIONS', '3');
+    setTestEnvironment('RERANKER_PROVIDER', 'compatible');
+    setTestEnvironment('RERANKER_BASE_URL', `http://127.0.0.1:${llmPort}/v1`);
+    setTestEnvironment('RERANKER_API_KEY', 'local-acceptance-test-key');
+    setTestEnvironment('RERANKER_MODEL', 'acceptance-reranker');
     setTestEnvironment('BULLMQ_PREFIX', `knowflow-rag-test-${process.pid}-${Date.now()}`);
 
     const { AppModule } = await import('../app.module');
@@ -343,19 +391,37 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     ).toBe(true);
 
     const persistedVectors = await app.get(PrismaService).$queryRaw<
-      Array<{ total: number; embedded: number; dimensions: number }>
+      Array<{
+        total: number;
+        embedded: number;
+        dimensions: number;
+        profileRows: number;
+        model: string;
+        version: string;
+      }>
     >(Prisma.sql`
       SELECT
         COUNT(*)::int AS total,
         COUNT(c."embedding")::int AS embedded,
-        MIN(vector_dims(c."embedding"))::int AS dimensions
+        MIN(vector_dims(c."embedding"))::int AS dimensions,
+        COUNT(*) FILTER (
+          WHERE c."embeddingProvider" = 'openai-compatible'
+            AND c."embeddingModel" = 'acceptance-embedding-model'
+            AND c."embeddingVersion" = 'acceptance-v1'
+            AND c."embeddingDimension" = 3
+        )::int AS "profileRows",
+        MIN(c."embeddingModel") AS model,
+        MIN(c."embeddingVersion") AS version
       FROM "Chunk" c
       INNER JOIN "Document" d ON d."id" = c."documentId"
       WHERE d."knowledgeBaseId" = ${targetKnowledgeBase.body.id}
     `);
     expect(persistedVectors[0]!.total).toBeGreaterThan(3);
     expect(persistedVectors[0]!.embedded).toBe(persistedVectors[0]!.total);
-    expect(persistedVectors[0]!.dimensions).toBe(1536);
+    expect(persistedVectors[0]!.dimensions).toBe(3);
+    expect(persistedVectors[0]!.profileRows).toBe(persistedVectors[0]!.total);
+    expect(persistedVectors[0]!.model).toBe('acceptance-embedding-model');
+    expect(persistedVectors[0]!.version).toBe('acceptance-v1');
 
     const parisAnswer = await request(server)
       .post('/api/v1/query')
@@ -386,9 +452,24 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     const travelAnswer = await request(server)
       .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/query`)
       .set(ownerAuth)
-      .send({ question: '上海的住宿报销上限是多少？', topK: 5 })
+      .send({ question: '上海的住宿报销上限是多少？', topK: 5, debug: true })
       .expect(201);
     expect(travelAnswer.body.answer).toContain('600 元');
+    expect(travelAnswer.body.retrievalDebug.vectorCandidateCount).toBeGreaterThan(0);
+    expect(travelAnswer.body.retrievalDebug.keywordCandidateCount).toBeGreaterThan(0);
+    expect(
+      travelAnswer.body.retrievalDebug.candidates.some(
+        (candidate: { vectorRank: number | null; keywordRank: number | null }) =>
+          candidate.vectorRank !== null && candidate.keywordRank !== null,
+      ),
+    ).toBe(true);
+    expect(
+      travelAnswer.body.retrievalDebug.candidates.every(
+        (candidate: { fusionScore: number; rerankScore: number | null }) =>
+          Number.isFinite(candidate.fusionScore) &&
+          (candidate.rerankScore === null || Number.isFinite(candidate.rerankScore)),
+      ),
+    ).toBe(true);
     expect(
       travelAnswer.body.sources.some(
         (source: { documentName: string }) => source.documentName === 'travel-policy.md',
@@ -425,6 +506,41 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
           prompt.sources.every((source) => !source.documentName.includes('other-workspace-decoy')),
         ),
     ).toBe(true);
+
+    const evaluationQuestions = JSON.parse(
+      readFileSync(resolve(projectRoot, 'test/fixtures/rag-evaluation/questions.json'), 'utf8'),
+    ) as EvaluationQuestion[];
+    const evaluationResults = [];
+    let evaluationProfile: QueryResponse['retrievalDebug']['embeddingProfile'] | undefined;
+    for (const evaluationQuestion of evaluationQuestions) {
+      const evaluationResponse = await request(server)
+        .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/query`)
+        .set(ownerAuth)
+        .send({ question: evaluationQuestion.question, topK: 10, debug: true })
+        .expect(201);
+      const result = evaluationResponse.body as QueryResponse;
+      evaluationProfile ??= result.retrievalDebug.embeddingProfile;
+      evaluationResults.push(evaluateQuestionResult(evaluationQuestion, result));
+    }
+    const metrics = calculateMetrics(evaluationResults);
+    expect(metrics.questionCount).toBe(56);
+
+    const evaluationOutput = resolve(projectRoot, 'test/results/rag-acceptance-latest.json');
+    mkdirSync(resolve(projectRoot, 'test/results'), { recursive: true });
+    writeFileSync(
+      evaluationOutput,
+      `${JSON.stringify(
+        {
+          providerMode: 'deterministic-acceptance-stubs',
+          embeddingProfile: evaluationProfile,
+          metrics,
+          results: evaluationResults,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
   });
 });
 
@@ -473,4 +589,19 @@ async function waitForDocumentsReady(
       `文档处理超时，仍未完成：${JSON.stringify(diagnostics)}；Worker 错误：${workerErrors.join(' | ') || '无'}`,
     );
   }
+}
+
+function fakeEmbedding(text: string): number[] {
+  if (text.includes('法国') || text.includes('巴黎')) return [1, 0, 0];
+  if (text.includes('上海') || text.includes('住宿') || text.includes('差旅')) return [0, 1, 0];
+  if (text.includes('安全') || text.includes('Git') || text.includes('API Key')) return [0, 0, 1];
+  return [0.57735027, 0.57735027, 0.57735027];
+}
+
+function fakeRerankScore(query: string, content: string): number {
+  if (query.includes('法国') && content.includes('巴黎是法国首都')) return 1;
+  if (query.includes('上海') && content.includes('600 元')) return 1;
+  const queryChars = [...new Set(Array.from(query.replace(/[\s，。？?]/gu, '')))];
+  const matches = queryChars.filter((character) => content.includes(character)).length;
+  return matches / Math.max(queryChars.length, 1);
 }

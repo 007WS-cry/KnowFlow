@@ -2,6 +2,9 @@
 node_modules/
 dist/
 coverage/
+.jest-cache/
+test/results/rag-acceptance-latest.json
+test/results/rag-evaluation-latest.json
 .nyc_output/
 
 # local configuration and secrets

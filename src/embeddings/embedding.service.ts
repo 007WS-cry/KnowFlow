@@ -1,54 +1,79 @@
-import { Injectable } from '@nestjs/common';
-import { VECTOR_DIMENSIONS } from './vector.constants';
+import { Inject, Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { EmbeddingProfile, EmbeddingProvider, EMBEDDING_PROVIDER } from './embedding.types';
 
 @Injectable()
 export class EmbeddingService {
+  private readonly providerBatchSize = 32;
+  private readonly queryPrefix: string;
+  private readonly documentPrefix: string;
+  private readonly pipelineVersion: string;
+
+  constructor(
+    @Inject(EMBEDDING_PROVIDER) private readonly provider: EmbeddingProvider,
+    config: ConfigService,
+  ) {
+    this.queryPrefix = config.get<string>('EMBEDDING_QUERY_PREFIX', '');
+    this.documentPrefix = config.get<string>('EMBEDDING_DOCUMENT_PREFIX', '');
+    this.pipelineVersion =
+      this.queryPrefix || this.documentPrefix
+        ? `${provider.version};q=${encodeURIComponent(this.queryPrefix)};d=${encodeURIComponent(this.documentPrefix)}`
+        : provider.version;
+  }
+
   async embed(text: string): Promise<number[]> {
-    const vector = new Array<number>(VECTOR_DIMENSIONS).fill(0);
-    const normalized = text.normalize('NFKC').toLowerCase();
+    return this.embedQuery(text);
+  }
 
-    for (const word of normalized.match(/[\p{L}\p{N}_]+/gu) ?? []) {
-      if (!/[\u3400-\u4dbf\u4e00-\u9fff]/u.test(word)) {
-        this.addFeature(vector, `w:${word}`, 1.5);
-        continue;
-      }
+  async embedQuery(text: string): Promise<number[]> {
+    return (await this.embedMany([`${this.queryPrefix}${text}`]))[0]!;
+  }
 
-      const characters = Array.from(word);
-      for (let index = 0; index < characters.length; index += 1) {
-        this.addFeature(vector, `c:${characters[index]}`, 0.35);
-        if (index + 1 < characters.length) {
-          this.addFeature(vector, `b:${characters[index]}${characters[index + 1]}`, 1.25);
-        }
-        if (index + 2 < characters.length) {
-          this.addFeature(
-            vector,
-            `t:${characters[index]}${characters[index + 1]}${characters[index + 2]}`,
-            1,
-          );
-        }
+  embedDocuments(texts: string[]): Promise<number[][]> {
+    return this.embedMany(texts.map((text) => `${this.documentPrefix}${text}`));
+  }
+
+  async embedMany(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const vectors: number[][] = [];
+    for (let offset = 0; offset < texts.length; offset += this.providerBatchSize) {
+      const batch = texts.slice(offset, offset + this.providerBatchSize);
+      const embedded = await this.provider.embedMany(batch);
+      if (embedded.length !== batch.length) {
+        throw new Error('Embedding provider returned the wrong vector count');
       }
+      const dimension = embedded[0]?.length;
+      if (
+        !dimension ||
+        dimension > 2000 ||
+        embedded.some(
+          (vector) =>
+            vector.length !== dimension || vector.some((value) => !Number.isFinite(value)),
+        )
+      ) {
+        throw new Error('Embedding provider returned invalid vectors');
+      }
+      if (vectors.length > 0 && vectors[0]!.length !== dimension) {
+        throw new Error('Embedding provider changed vector dimensions within one batch');
+      }
+      vectors.push(...embedded);
     }
+    return vectors;
+  }
 
-    const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
-    if (magnitude === 0) return vector;
-    return vector.map((value) => value / magnitude);
+  getProfile(dimension: number): EmbeddingProfile {
+    return {
+      provider: this.provider.providerName,
+      model: this.provider.model,
+      version: this.pipelineVersion,
+      dimension,
+    };
   }
 
   toPgVector(vector: number[]): string {
-    if (vector.length !== VECTOR_DIMENSIONS) {
-      throw new Error(`Expected a ${VECTOR_DIMENSIONS}-dimension embedding`);
+    if (!vector.length || vector.length > 2000 || vector.some((value) => !Number.isFinite(value))) {
+      throw new Error('Expected a finite pgvector embedding with 1 to 2000 dimensions');
     }
-    return `[${vector.map((value) => (Number.isFinite(value) ? value.toFixed(8) : '0')).join(',')}]`;
-  }
-
-  private addFeature(vector: number[], feature: string, weight: number): void {
-    let hash = 2_166_136_261;
-    for (let index = 0; index < feature.length; index += 1) {
-      hash = Math.imul(hash ^ feature.charCodeAt(index), 16_777_619);
-    }
-    const unsignedHash = hash >>> 0;
-    const bucket = unsignedHash % VECTOR_DIMENSIONS;
-    vector[bucket] =
-      (vector[bucket] ?? 0) + ((unsignedHash & 0x8000_0000) === 0 ? weight : -weight);
+    return `[${vector.map((value) => value.toFixed(8)).join(',')}]`;
   }
 }

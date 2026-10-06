@@ -19,7 +19,7 @@ export class RagController {
     @CurrentUser() user: AuthenticatedUser,
     @Body() body: QueryByKnowledgeBaseDto,
   ) {
-    return this.rag.ask(user.id, body.knowledgeBaseId, body.question, body.topK);
+    return this.rag.ask(user.id, body.knowledgeBaseId, body.question, body.topK, body.debug);
   }
 
   @Post('knowledge-bases/:knowledgeBaseId/query')
@@ -28,6 +28,6 @@ export class RagController {
     @Param('knowledgeBaseId') knowledgeBaseId: string,
     @Body() body: AskQuestionDto,
   ) {
-    return this.rag.ask(user.id, knowledgeBaseId, body.question, body.topK);
+    return this.rag.ask(user.id, knowledgeBaseId, body.question, body.topK, body.debug);
   }
 }
