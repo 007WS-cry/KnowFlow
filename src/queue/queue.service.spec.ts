@@ -2,7 +2,7 @@ import { Queue } from 'bullmq';
 import { QueueService } from './queue.service';
 
 describe('QueueService', () => {
-  it('adds one document job with a stable job ID and retry backoff', async () => {
+  it('adds a versioned document job with a stable retry backoff', async () => {
     const queue = { add: jest.fn().mockResolvedValue({ id: 'document-1' }) };
     const service = new QueueService(queue as unknown as Queue);
 
@@ -11,7 +11,7 @@ describe('QueueService', () => {
       'process-document',
       { documentId: 'document-1' },
       expect.objectContaining({
-        jobId: 'document-1',
+        jobId: 'document-1-r0',
         attempts: 5,
         backoff: { type: 'exponential', delay: 1_000 },
       }),

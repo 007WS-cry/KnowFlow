@@ -62,6 +62,15 @@ export class WorkspacePolicyGuard implements CanActivate {
       return knowledgeBase.workspaceId;
     }
 
+    if (resource.type === 'conversation') {
+      const conversation = await this.prisma.conversation.findUnique({
+        where: { id: value },
+        select: { knowledgeBase: { select: { workspaceId: true } } },
+      });
+      if (!conversation) throw new NotFoundException('对话不存在');
+      return conversation.knowledgeBase.workspaceId;
+    }
+
     const document = await this.prisma.document.findUnique({
       where: { id: value },
       select: { knowledgeBase: { select: { workspaceId: true } } },

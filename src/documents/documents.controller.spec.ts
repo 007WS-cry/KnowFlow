@@ -1,25 +1,28 @@
-import { INestApplication } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import request from 'supertest';
 import { AuthGuard } from '../auth/auth.guard';
 import { WorkspacePolicyGuard } from '../authorization/workspace-policy.guard';
 import { DocumentsController } from './documents.controller';
 import { DocumentsService } from './documents.service';
-import { UploadedFile } from './uploaded-file';
 
-describe('DocumentsController multipart filename encoding', () => {
-  let app: INestApplication;
-  let moduleRef: TestingModule;
-  const upload = jest.fn(
-    async (_userId: string, _knowledgeBaseId: string, file?: UploadedFile) => ({
-      originalName: file?.originalname,
+describe('DocumentsController direct upload API', () => {
+  const createUploadTask = jest.fn(
+    async (
+      _userId: string,
+      _knowledgeBaseId: string,
+      input: { originalName: string; sizeBytes: number },
+    ) => ({
+      document: { id: 'doc-1', originalName: input.originalName },
+      uploadMode: 'single',
+      uploadUrl: 'https://minio.test/upload',
     }),
   );
 
+  let controller: DocumentsController;
+
   beforeAll(async () => {
-    moduleRef = await Test.createTestingModule({
+    const moduleRef: TestingModule = await Test.createTestingModule({
       controllers: [DocumentsController],
-      providers: [{ provide: DocumentsService, useValue: { upload } }],
+      providers: [{ provide: DocumentsService, useValue: { createUploadTask } }],
     })
       .overrideGuard(AuthGuard)
       .useValue({
@@ -38,33 +41,22 @@ describe('DocumentsController multipart filename encoding', () => {
       .useValue({ canActivate: () => true })
       .compile();
 
-    app = moduleRef.createNestApplication();
-    app.setGlobalPrefix('api/v1');
-    await app.init();
-  });
-
-  afterAll(async () => {
-    await app.close();
+    controller = moduleRef.get(DocumentsController);
   });
 
   beforeEach(() => jest.clearAllMocks());
 
-  it('preserves Chinese filenames parsed from multipart/form-data', async () => {
+  it('creates a metadata-only upload task and preserves UTF-8 filenames', async () => {
     const filename = 'KnowFlow 企业知识库平台使用手册.md';
-
-    const response = await request(app.getHttpServer())
-      .post('/api/v1/knowledge-bases/kb-1/documents')
-      .attach('file', Buffer.from('# KnowFlow'), {
-        filename,
-        contentType: 'text/markdown',
-      })
-      .expect(201);
-
-    expect(response.body).toEqual({ originalName: filename });
-    expect(upload).toHaveBeenCalledWith(
-      'user-1',
+    const result = await controller.createUpload(
+      { id: 'user-1', email: 'user@example.com', name: null },
       'kb-1',
-      expect.objectContaining({ originalname: filename }),
+      { originalName: filename, sizeBytes: 1024 },
     );
+    expect(result.document.originalName).toBe(filename);
+    expect(createUploadTask).toHaveBeenCalledWith('user-1', 'kb-1', {
+      originalName: filename,
+      sizeBytes: 1024,
+    });
   });
 });

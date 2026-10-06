@@ -62,7 +62,15 @@ export interface KnowledgeBase {
   _count: { documents: number };
 }
 
-export type DocumentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
+export type DocumentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' | 'CANCELLED';
+export type DocumentProcessingStage =
+  | 'UPLOAD'
+  | 'QUEUED'
+  | 'PARSING'
+  | 'CHUNKING'
+  | 'EMBEDDING'
+  | 'INDEXING'
+  | 'COMPLETE';
 
 export interface KnowledgeDocument {
   id: string;
@@ -72,6 +80,9 @@ export interface KnowledgeDocument {
   mimeType: string;
   sizeBytes: number;
   status: DocumentStatus;
+  processingStage: DocumentProcessingStage;
+  progress: number;
+  retryCount: number;
   errorMessage: string | null;
   processedAt: string | null;
   createdAt: string;
@@ -85,6 +96,8 @@ export interface RetrievedChunk {
   chunkIndex: number;
   content: string;
   score: number;
+  pageNumber?: number | null;
+  headingPath?: string[];
 }
 
 export interface RagResponse {
@@ -99,6 +112,32 @@ export interface RagResponse {
     documentName: string;
     chunkIndex: number;
     score: number;
+    pageNumber?: number | null;
+    headingPath?: string[];
   }>;
   citations: RagResponse['sources'];
+}
+
+export interface UploadStartResponse {
+  document: KnowledgeDocument;
+  uploadMode: 'single' | 'multipart';
+  uploadUrl?: string;
+  partSizeBytes?: number;
+  partCount?: number;
+}
+
+export interface ConversationSummary {
+  id: string;
+  knowledgeBaseId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationMessage {
+  id: string;
+  role: 'USER' | 'ASSISTANT';
+  content: string;
+  citations: RagResponse['citations'] | null;
+  createdAt: string;
 }

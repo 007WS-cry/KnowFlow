@@ -62,6 +62,9 @@ export class WorkspacePolicyService {
       case 'MEMBER_LIST':
         return;
 
+      case 'DOCUMENT_PROCESS':
+        return this.assertCanProcessDocument(userId, role, request);
+
       case 'WORKSPACE_UPDATE':
       case 'WORKSPACE_DELETE':
         if (role === WorkspaceRole.OWNER) return;
@@ -96,6 +99,23 @@ export class WorkspacePolicyService {
 
       case 'DOCUMENT_DELETE':
         return this.assertCanDeleteDocuments(userId, role, workspaceId, request);
+    }
+  }
+
+  private async assertCanProcessDocument(
+    userId: string,
+    actorRole: WorkspaceRole,
+    request: WorkspacePolicyRequest,
+  ): Promise<void> {
+    if (actorRole === WorkspaceRole.OWNER || actorRole === WorkspaceRole.ADMIN) return;
+    const documentId = this.param(request, 'documentId');
+    const document = await this.prisma.document.findUnique({
+      where: { id: documentId },
+      select: { uploadedByUserId: true },
+    });
+    if (!document) throw new NotFoundException('文档不存在');
+    if (document.uploadedByUserId !== userId) {
+      throw new ForbiddenException('MEMBER 只能管理自己上传的文档任务');
     }
   }
 

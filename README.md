@@ -23,6 +23,8 @@ docker compose up -d --build
 
 上传文档前需要配置 Embedding 服务；提问前还需要配置 Reranker 与 LLM。Embedding 默认使用 OpenAI-compatible `/embeddings` 接口，Reranker 使用独立的 `/rerank` 接口。服务地址可以指向云 API 或本机运行的推理服务；使用 Docker Compose 连接宿主机上的服务时，请使用 `host.docker.internal`，并确保服务监听可被容器访问的地址。
 
+文档内容由浏览器通过 MinIO Presigned URL 直传，不经过 API 上传进程。默认单文件上限为 200 MB，32 MB 以上使用 Multipart Upload。Compose 默认将浏览器可访问的 MinIO 地址设为 `http://localhost:9000`，并允许 `CORS_ORIGIN` 指定的前端来源。前端不在本机时，请将 `.env` 中的 `MINIO_PUBLIC_ENDPOINT`、`MINIO_PUBLIC_PORT` 和 `MINIO_PUBLIC_USE_SSL` 设置为浏览器可访问的 MinIO 地址；反向代理、TLS 与 MinIO CORS 也必须允许前端来源及 PUT 请求。
+
 服务启动后可访问：
 
 - API：<http://localhost:8000/api/v1>
@@ -113,9 +115,10 @@ API 路径前缀为 `/api/v1`。除注册和登录外，业务请求需带上 `A
 2. Workspace 支持 `POST /workspaces` 创建、`GET /workspaces` 列表、`GET /workspaces/{workspaceId}` 详情、`PATCH /workspaces/{workspaceId}` 更新和 `DELETE /workspaces/{workspaceId}` 删除。只有 OWNER 可以重命名或删除。
 3. Knowledge Base 使用 `POST`、`GET /workspaces/{workspaceId}/knowledge-bases` 创建和列表；单项详情、更新、删除使用 `GET`、`PATCH`、`DELETE /knowledge-bases/{knowledgeBaseId}`。所有成员可查看；创建、编辑、删除仅 OWNER/ADMIN 可用。
 4. `GET /knowledge-bases/{knowledgeBaseId}/documents` 查看文档。新建知识库默认返回空数组。
-5. `POST /knowledge-bases/{knowledgeBaseId}/documents` 以 `multipart/form-data` 上传字段 `file`。支持 TXT、Markdown、PDF、DOCX，默认最大 10 MB。上传文件名按 UTF-8 解码；早期因 Latin-1 解码保存的中文乱码文件名会在列表、状态和 RAG 引用响应中自动恢复显示。文档列表包含上传者；历史文档或已删除账号的上传者显示为空。文档进入 BullMQ 后台处理，轮询文档列表或 `GET /documents/{documentId}` 可查看 `PENDING`、`PROCESSING`、`READY` 或 `FAILED` 状态。
-6. `DELETE /knowledge-bases/{knowledgeBaseId}/documents` 按 ID 批量删除：`{"documentIds":["doc_id_1","doc_id_2"]}`。MEMBER 只能删除自己上传的文档；ADMIN/OWNER 可删除任意文档。这会同时删除 MinIO 对象和 PostgreSQL 中的文档及 chunks。
-7. `POST /query` 提问：`{"knowledgeBaseId":"kb_id","question":"差旅报销的流程是什么？","topK":5}`。响应包含 LLM `answer`、重排后的 `chunks`、`sources` 与 `citations`。需要调试检索时加入 `"debug":true`，响应会附 `retrievalDebug`，列出候选的向量名次、关键词名次、融合分数和重排分数。旧路径 `POST /knowledge-bases/{knowledgeBaseId}/query` 仍可使用。
+5. `POST /knowledge-bases/{knowledgeBaseId}/documents/uploads` 创建上传任务，JSON 为 `{"originalName":"handbook.pdf","sizeBytes":123456}`。响应提供单文件 Presigned URL，或 Multipart 参数。浏览器将文件直传 MinIO；分片上传时按需调用 `POST /documents/{documentId}/uploads/parts/url` 获取分片地址，最后调用 `POST /documents/{documentId}/uploads/complete` 启动索引。支持 TXT、Markdown、PDF、DOCX；默认最大 200 MB，可用 `MAX_UPLOAD_BYTES` 调整。文档列表和 `GET /documents/{documentId}` 返回任务阶段、百分比、失败原因与重试次数。上传链接 1 小时失效，未完成上传任务 24 小时后自动清理。
+6. `POST /documents/{documentId}/retry` 重试失败任务；`POST /documents/{documentId}/reindex` 重新索引；`POST /documents/{documentId}/cancel` 取消上传或处理任务。文档处理按解析、结构化切块、Embedding、索引等阶段汇报状态。重索引先构建新 Chunk 版本，成功后切换；重建期间旧索引仍可用于问答。引用包含文件名、页码或标题路径等结构化位置信息。
+7. `DELETE /knowledge-bases/{knowledgeBaseId}/documents` 按 ID 批量删除：`{"documentIds":["doc_id_1","doc_id_2"]}`。MEMBER 只能删除自己上传的文档；ADMIN/OWNER 可删除任意文档。这会同时删除 MinIO 对象、文档和 chunks，并递增知识库索引版本。
+8. 普通查询仍可使用 `POST /query` 或 `POST /knowledge-bases/{knowledgeBaseId}/query`。持久化对话使用 `POST /conversations` 创建，`GET /knowledge-bases/{knowledgeBaseId}/conversations` 列表，`GET /conversations/{conversationId}/messages` 读取历史；`POST /conversations/{conversationId}/messages/stream` 以 SSE 流式发送追问，客户端断开会取消当前 LLM 请求，未完成回合不会写入历史。
 
 注册请求示例：
 
@@ -133,7 +136,11 @@ Workspace、知识库、文档和 RAG 查询均按当前用户的 Workspace 成�
 
 ## RAG 与数据模型
 
-文档原文件存入 MinIO。后台 Worker 抽取文本、按约 1,200 字切块，并通过 Embedding Provider 生成向量。提问时先检查 Workspace 访问权，再并行执行 pgvector 语义召回与 PostgreSQL 全文/trigram 关键词召回，经 RRF 融合和独立 Reranker 排序后，将 Top K 片段交给 LLM，并返回来源引用。空知识库会返回提示与空来源，不调用 LLM。`debug:true` 可查看两路召回、融合和重排结果。
+文档原文件存入 MinIO，浏览器以 Presigned URL 直传，API 进程不缓冲文件内容。后台 Worker 解析 Markdown/TXT 标题与段落、PDF 页码、DOCX 标题和表格，再按约 1,200 字生成带有页码、标题路径、段落位置和表格行位置的 Chunk。Worker 默认并发为 1，可通过 `DOCUMENT_PROCESSING_CONCURRENCY` 调整；PDF/DOCX 解析会在 Worker 中读取文件，部署时应按文件上限配置足够内存。
+
+提问时先检查 Workspace 访问权，再并行执行 pgvector 语义召回与 PostgreSQL 全文/trigram 关键词召回，经 RRF 融合和独立 Reranker 排序后，将 Top K 片段交给 LLM，并返回带文档位置的来源引用。空知识库会返回提示与空来源，不调用 LLM。`debug:true` 可查看两路召回、融合和重排结果。问答工作台使用 SSE 流式回答，并保存 Conversation/Message 历史以支持追问。
+
+Redis 会缓存检索结果，默认有效期 5 分钟。缓存 key 包含 Workspace、Knowledge Base、索引版本、问题和模型/检索配置。每次文档索引成功切换或删除会递增 Knowledge Base 的 `indexVersion`，新查询自然进入新缓存版本；Redis 暂时不可用时会直接执行检索。
 
 Embedding Provider 支持 OpenAI-compatible `/embeddings` 和本地 Transformers.js/ONNX 模型目录。模型名、版本和输出维度随 chunk 保存。切换 Embedding 模型或版本后，先重建全部向量：
 
@@ -165,6 +172,8 @@ src/
   health/                 # 健康检查
   knowledge-bases/        # 知识库 CRUD 与成员权限检查
   authorization/          # Workspace 角色矩阵与统一 Policy Guard
+  cache/                  # Redis 检索结果缓存
+  conversations/          # 对话、历史消息和 SSE 流式问答
   prisma/                 # Prisma client 生命周期
   queue/                  # BullMQ 队列
   rag/                    # 双路召回、RRF 融合、检索调试与 RAG 查询
@@ -183,9 +192,9 @@ docker-compose.yml
 
 Compose 从 MinIO 官方源码构建固定版本并提供本地 S3 API。MinIO 上游仓库已归档，生产部署前请评估维护与支持要求。
 
-文档处理链路为 MinIO 上传、Prisma 文档记录、BullMQ 入队、Worker 文本解析与分块、Embedding 计算、pgvector 批量写入，完成后将文档标记为 `READY`。处理失败会清除已写入的 chunks、记录错误并抛出异常，让 BullMQ 按退避策略重试；每次重试会先清理该文档已有 chunks，避免重复写入。
+文档处理链路为创建上传任务、MinIO 单文件或 Multipart 直传、Complete 校验、BullMQ 入队、Worker 解析与结构化切块、Embedding 计算、pgvector 分批写入和版本切换。任务失败会保留失败原因；队列重试或手动 Retry 会写入新索引版本，旧活动版本在新版本提交前继续供查询。任务支持取消；未完成的 MinIO Multipart 会在取消或过期时清理。
 
-`npm test` 统一运行 Jest 测试。单元测试覆盖认证、请求校验、统一 Workspace Policy 的角色矩阵、Workspace/Knowledge Base 数据操作、Provider 响应校验、RRF、RAG 调试数据，以及文档处理与重试幂等性。RAG 验收测试会使用 PostgreSQL + pgvector、Redis/BullMQ 和 MinIO，执行注册、创建 Workspace/知识库、上传 Markdown、等待 Worker 完成、确认向量及模型元数据落库，并发起混合检索、重排和 RAG 查询；协作验收还会通过 HTTP 验证 OWNER/ADMIN/MEMBER 权限和邀请接受流程。请先启动 Compose 依赖（`docker compose up -d postgres redis minio`）并确保 `.env` 中数据库连接指向 `localhost`；测试会创建带随机名称的独立 PostgreSQL 数据库、执行实际迁移，结束后删除该测试库。验收测试使用本地假 Embedding、Reranker 和 LLM 服务，不会消耗外部 API key，并通过唯一 BullMQ 前缀隔离正在运行的应用队列。样例语料位于 `test/fixtures/rag-acceptance/`。
+`npm test` 统一运行 Jest 测试。单元测试覆盖直传上传任务、Multipart 校验、结构化 Chunk、任务阶段与重试、SSE 解析、Conversation 权限和 Redis 缓存 key。RAG 验收测试会使用 PostgreSQL + pgvector、Redis/BullMQ 和 MinIO，执行注册、创建 Workspace/知识库、经 Presigned URL 上传 Markdown、等待 Worker 完成、确认向量与索引版本落库，并执行混合检索、重排、对话流式问答和固定集指标评测。请先启动 Compose 依赖（`docker compose up -d postgres redis minio`）并确保 `.env` 中数据库连接指向 `localhost`；测试会创建带随机名称的独立 PostgreSQL 数据库、执行实际迁移，结束后删除该测试库。验收测试使用本地假 Embedding、Reranker 和 LLM 服务，不会消耗外部模型 API key，并通过唯一 BullMQ 前缀隔离正在运行的应用队列。样例语料位于 `test/fixtures/rag-acceptance/`。
 
 固定评测集位于 `test/fixtures/rag-evaluation/questions.json`，包含 56 道问题及相关文档标注，覆盖现有三份示例语料。将这些 Markdown 文档上传到一个知识库后，设置有权访问该知识库的 ID 和 access token，再运行：
 

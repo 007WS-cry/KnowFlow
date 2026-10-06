@@ -10,6 +10,7 @@ export type WorkspaceAction =
   | 'KNOWLEDGE_BASE_MANAGE'
   | 'DOCUMENT_VIEW'
   | 'DOCUMENT_UPLOAD'
+  | 'DOCUMENT_PROCESS'
   | 'DOCUMENT_DELETE'
   | 'MEMBER_LIST'
   | 'MEMBER_INVITE'
@@ -21,6 +22,7 @@ export type WorkspaceAction =
 export type WorkspaceResourceRef =
   | { type: 'workspace'; source: 'param'; key: string }
   | { type: 'knowledgeBase'; source: 'param' | 'body'; key: string }
+  | { type: 'conversation'; source: 'param'; key: string }
   | { type: 'document'; source: 'param'; key: string };
 
 export interface WorkspacePermissionMetadata {
@@ -55,6 +57,12 @@ export const knowledgeBaseBody = (key: string): WorkspaceResourceRef => ({
 
 export const documentParam = (key: string): WorkspaceResourceRef => ({
   type: 'document',
+  source: 'param',
+  key,
+});
+
+export const conversationParam = (key: string): WorkspaceResourceRef => ({
+  type: 'conversation',
   source: 'param',
   key,
 });

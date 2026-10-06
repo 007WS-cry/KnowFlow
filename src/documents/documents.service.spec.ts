@@ -1,72 +1,69 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../storage/minio.service';
 import { QueueService } from '../queue/queue.service';
 import { KnowledgeBasesService } from '../knowledge-bases/knowledge-bases.service';
-import { UploadedFile } from './uploaded-file';
 import { DocumentsService } from './documents.service';
 
-describe('DocumentsService upload pipeline', () => {
-  const file = (originalname = 'notes.txt', content = 'KnowFlow notes'): UploadedFile => {
-    const buffer = Buffer.from(content);
-    return { originalname, size: buffer.length, buffer };
-  };
-
+describe('DocumentsService direct-to-MinIO upload workflow', () => {
+  const now = new Date();
   const document = {
     id: 'document-1',
     knowledgeBaseId: 'kb-1',
     uploadedByUserId: 'user-1',
-    originalName: 'notes.txt',
-    mimeType: 'text/plain',
-    objectKey: 'workspace-1/kb-1/object/notes.txt',
-    sizeBytes: BigInt(Buffer.byteLength('KnowFlow notes')),
+    originalName: 'notes.md',
+    mimeType: 'text/markdown',
+    objectKey: 'workspace-1/kb-1/object/notes.md',
+    sizeBytes: BigInt(5),
     status: 'PENDING',
+    processingStage: 'UPLOAD',
+    progress: 0,
+    retryCount: 0,
+    multipartUploadId: 'multipart-1',
     errorMessage: null,
     processedAt: null,
-    createdAt: new Date(),
-    updatedAt: new Date(),
+    createdAt: now,
+    updatedAt: now,
   };
-  const events: string[] = [];
-  const transaction = {
-    document: {
-      create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
-        events.push('database');
-        return { ...document, ...data };
-      }),
-    },
-    knowledgeBase: { update: jest.fn().mockResolvedValue({}) },
+  const config = {
+    get: jest.fn((key: string, fallback: unknown) => fallback),
   };
   const prismaMock = {
-    $transaction: jest.fn((callback: (tx: typeof transaction) => unknown) => callback(transaction)),
-    document: { update: jest.fn(), findMany: jest.fn(), findUnique: jest.fn() },
+    document: {
+      create: jest.fn().mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({
+        ...document,
+        ...data,
+      })),
+      findUnique: jest.fn().mockResolvedValue(document),
+      findMany: jest.fn(),
+      update: jest.fn().mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({
+        ...document,
+        ...data,
+      })),
+    },
+    $transaction: jest.fn(),
   };
   const storageClient = {
-    putObject: jest.fn(
-      async (
-        _bucket: string,
-        _objectKey: string,
-        _buffer: Buffer,
-        _size: number,
-        _metadata: Record<string, string>,
-      ) => {
-        events.push('minio');
-        return { etag: 'etag' };
-      },
+    statObject: jest.fn().mockResolvedValue({ size: 5 }),
+    getPartialObject: jest.fn().mockResolvedValue(
+      (async function* () {
+        yield Buffer.from('test');
+      })(),
     ),
     removeObject: jest.fn().mockResolvedValue(undefined),
   };
   const storage = {
     getClient: () => storageClient,
     getBucket: () => 'knowflow-documents',
+    signSingleUpload: jest.fn().mockResolvedValue('https://minio.test/signed-put'),
+    initiateMultipart: jest.fn().mockResolvedValue('multipart-1'),
+    signMultipartPart: jest.fn().mockResolvedValue('https://minio.test/signed-part'),
+    completeMultipart: jest.fn().mockResolvedValue({ etag: 'done' }),
+    listMultipartParts: jest.fn().mockResolvedValue([]),
+    abortMultipart: jest.fn().mockResolvedValue(undefined),
   };
-  const config = { get: jest.fn((_key: string, fallback: string) => fallback) };
-  const queue = {
-    enqueueDocumentProcessing: jest.fn(async () => {
-      events.push('queue');
-      return 'job-document-1';
-    }),
-  };
+  const queue = { enqueueDocumentProcessing: jest.fn().mockResolvedValue('job-1') };
   const knowledgeBases = {
     getById: jest.fn().mockResolvedValue({ id: 'kb-1', workspaceId: 'workspace-1' }),
   };
@@ -80,113 +77,111 @@ describe('DocumentsService upload pipeline', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    events.length = 0;
-    prismaMock.$transaction.mockImplementation((callback: (tx: typeof transaction) => unknown) =>
-      callback(transaction),
+    config.get.mockImplementation((_key: string, fallback: unknown) => fallback);
+    prismaMock.document.create.mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => ({
+        ...document,
+        ...data,
+      }),
     );
-    transaction.document.create.mockImplementation(async ({ data }) => {
-      events.push('database');
-      return { ...document, ...data };
-    });
-    storageClient.putObject.mockImplementation(async () => {
-      events.push('minio');
-      return { etag: 'etag' };
-    });
-    queue.enqueueDocumentProcessing.mockImplementation(async () => {
-      events.push('queue');
-      return 'job-document-1';
-    });
+    prismaMock.document.findUnique.mockResolvedValue(document);
+    prismaMock.document.update.mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => ({ ...document, ...data }),
+    );
+    storageClient.statObject.mockResolvedValue({ size: 5 });
+    storage.signSingleUpload.mockResolvedValue('https://minio.test/signed-put');
+    storage.initiateMultipart.mockResolvedValue('multipart-1');
+    queue.enqueueDocumentProcessing.mockResolvedValue('job-1');
     knowledgeBases.getById.mockResolvedValue({ id: 'kb-1', workspaceId: 'workspace-1' });
   });
 
-  it('stores a supported file, creates its DB record, then enqueues processing', async () => {
-    const payload = file();
-    const result = await service.upload('user-1', 'kb-1', payload);
-
-    expect(events).toEqual(['minio', 'database', 'queue']);
-    expect(storageClient.putObject).toHaveBeenCalledWith(
-      'knowflow-documents',
+  it('creates a small-file upload task and returns a signed URL without passing bytes through the API', async () => {
+    const result = await service.createUploadTask('user-1', 'kb-1', {
+      originalName: 'notes.md',
+      sizeBytes: 5,
+    });
+    expect(storage.signSingleUpload).toHaveBeenCalledWith(
       expect.stringMatching(/^workspace-1\/kb-1\//),
-      payload.buffer,
-      payload.size,
-      { 'Content-Type': 'text/plain' },
+      3600,
     );
-    const createdRecord = transaction.document.create.mock.calls[0]![0].data;
-    expect(createdRecord).toEqual(
-      expect.objectContaining({
-        knowledgeBaseId: 'kb-1',
-        uploadedByUserId: 'user-1',
-        originalName: 'notes.txt',
-        mimeType: 'text/plain',
-        sizeBytes: BigInt(payload.size),
-      }),
-    );
-    expect(createdRecord.objectKey).toBe(storageClient.putObject.mock.calls[0]![1]);
-    expect(queue.enqueueDocumentProcessing).toHaveBeenCalledWith('document-1');
-    expect(result).toMatchObject({ id: 'document-1', status: 'PENDING', jobId: 'job-document-1' });
-    expect(result.sizeBytes).toBe(payload.size);
+    expect(storageClient).not.toHaveProperty('putObject');
+    expect(result).toMatchObject({
+      uploadMode: 'single',
+      uploadUrl: 'https://minio.test/signed-put',
+      document: { id: 'document-1', status: 'PENDING', processingStage: 'UPLOAD', sizeBytes: 5 },
+    });
   });
 
-  it('rejects unsupported and oversized files before writing to MinIO', async () => {
-    await expect(service.upload('user-1', 'kb-1', file('script.exe'))).rejects.toBeInstanceOf(
-      BadRequestException,
+  it('uses Multipart Upload for large files and signs requested parts', async () => {
+    const result = await service.createUploadTask('user-1', 'kb-1', {
+      originalName: 'large.txt',
+      sizeBytes: 40 * 1024 * 1024,
+    });
+    expect(result).toMatchObject({
+      uploadMode: 'multipart',
+      partSizeBytes: 16 * 1024 * 1024,
+      partCount: 3,
+    });
+    prismaMock.document.findUnique.mockResolvedValueOnce({
+      ...document,
+      sizeBytes: BigInt(40 * 1024 * 1024),
+    });
+    await expect(service.getPartUploadUrl('document-1', 2)).resolves.toEqual({
+      partNumber: 2,
+      uploadUrl: 'https://minio.test/signed-part',
+    });
+    expect(storage.signMultipartPart).toHaveBeenCalledWith(document.objectKey, 'multipart-1', 2);
+  });
+
+  it('completes all declared parts, verifies MinIO size, and enqueues the worker', async () => {
+    prismaMock.document.findUnique.mockResolvedValueOnce({
+      ...document,
+      sizeBytes: BigInt(5),
+      multipartUploadId: null,
+    });
+    storageClient.statObject.mockResolvedValueOnce({ size: 5 });
+    const result = await service.completeUpload('document-1');
+    expect(prismaMock.document.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'document-1' },
+        data: expect.objectContaining({ processingStage: 'QUEUED', progress: 2 }),
+      }),
+    );
+    expect(queue.enqueueDocumentProcessing).toHaveBeenCalledWith('document-1', 0);
+    expect(result).toMatchObject({ jobId: 'job-1' });
+  });
+
+  it('rejects unsupported and oversized files before creating a task', async () => {
+    await expect(
+      service.createUploadTask('user-1', 'kb-1', { originalName: 'script.exe', sizeBytes: 1 }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    config.get.mockImplementation((key: string, fallback: unknown) =>
+      key === 'MAX_UPLOAD_BYTES' ? 20 : fallback,
     );
     await expect(
-      service.upload('user-1', 'kb-1', {
-        originalname: 'large.txt',
-        size: 10 * 1024 * 1024 + 1,
-        buffer: Buffer.alloc(1),
-      }),
+      service.createUploadTask('user-1', 'kb-1', { originalName: 'large.txt', sizeBytes: 21 }),
     ).rejects.toBeInstanceOf(BadRequestException);
-
-    expect(storageClient.putObject).not.toHaveBeenCalled();
-    expect(transaction.document.create).not.toHaveBeenCalled();
-    expect(queue.enqueueDocumentProcessing).not.toHaveBeenCalled();
+    expect(prismaMock.document.create).not.toHaveBeenCalled();
   });
 
-  it('returns repaired Chinese filenames for documents uploaded before the UTF-8 fix', async () => {
-    const filename = '研发部门信息安全与代码管理规范.md';
-    const mojibake = Buffer.from(filename, 'utf8').toString('latin1');
-    prismaMock.document.findMany.mockResolvedValueOnce([
-      {
-        id: 'document-legacy',
-        originalName: mojibake,
-        mimeType: 'text/markdown',
-        sizeBytes: BigInt(42),
-        status: 'READY',
-        errorMessage: null,
-        processedAt: new Date(),
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
+  it('rejects a Multipart Upload without all server-confirmed parts', async () => {
+    prismaMock.document.findUnique.mockResolvedValueOnce({
+      ...document,
+      sizeBytes: BigInt(40 * 1024 * 1024),
+      multipartUploadId: 'multipart-1',
+    });
+    storage.listMultipartParts.mockResolvedValueOnce([
+      { part: 1, etag: 'etag-1', size: 16 * 1024 * 1024 },
     ]);
-
-    const result = await service.list('kb-1');
-
-    expect(result[0]).toMatchObject({
-      id: 'document-legacy',
-      originalName: filename,
-      sizeBytes: 42,
-    });
+    await expect(service.completeUpload('document-1')).rejects.toBeInstanceOf(BadRequestException);
+    expect(storage.completeMultipart).not.toHaveBeenCalled();
   });
 
-  it('does not create a DB record or queue job when MinIO write fails', async () => {
-    storageClient.putObject.mockRejectedValueOnce(new Error('MinIO unavailable'));
-    await expect(service.upload('user-1', 'kb-1', file())).rejects.toThrow('MinIO unavailable');
-    expect(transaction.document.create).not.toHaveBeenCalled();
-    expect(queue.enqueueDocumentProcessing).not.toHaveBeenCalled();
-  });
-
-  it('removes the uploaded object if creating the DB record fails', async () => {
-    prismaMock.$transaction.mockImplementationOnce(async () => {
-      throw new Error('database unavailable');
+  it('rejects completing an upload task more than once', async () => {
+    prismaMock.document.findUnique.mockResolvedValueOnce({
+      ...document,
+      processingStage: 'QUEUED',
     });
-    await expect(service.upload('user-1', 'kb-1', file())).rejects.toThrow('database unavailable');
-    expect(storageClient.putObject).toHaveBeenCalledTimes(1);
-    expect(storageClient.removeObject).toHaveBeenCalledWith(
-      'knowflow-documents',
-      storageClient.putObject.mock.calls[0]![1],
-    );
-    expect(queue.enqueueDocumentProcessing).not.toHaveBeenCalled();
+    await expect(service.completeUpload('document-1')).rejects.toBeInstanceOf(ConflictException);
   });
 });

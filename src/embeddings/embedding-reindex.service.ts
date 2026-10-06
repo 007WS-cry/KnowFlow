@@ -64,6 +64,9 @@ export class EmbeddingReindexService {
       cursor = batch[batch.length - 1]!.id;
       this.logger.log(`Re-embedded ${processed} chunks with ${profile.provider}/${profile.model}`);
     }
+    await this.prisma.knowledgeBase.updateMany({
+      data: { indexVersion: { increment: 1 } },
+    });
     this.logger.log(
       `Embedding reindex completed: ${processed} chunks at ${profile.dimension} dimensions`,
     );

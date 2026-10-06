@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, clearAccessToken, setAccessToken } from './api';
+import { api, clearAccessToken, setAccessToken, streamConversationMessage } from './api';
 
 const fetchMock = vi.fn();
 
@@ -33,16 +33,91 @@ describe('frontend API client', () => {
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer session-token');
   });
 
-  it('preserves multipart boundaries when uploading documents', async () => {
+  it('creates an upload task, sends file bytes directly to MinIO, then completes the task', async () => {
     setAccessToken('session-token');
-    fetchMock.mockResolvedValue(jsonResponse(201, { id: 'doc-1', originalName: 'guide.md' }));
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(201, {
+        document: { id: 'doc-1', originalName: 'guide.md' },
+        uploadMode: 'single',
+        uploadUrl: 'https://minio.test/signed-put',
+      }))
+      .mockResolvedValueOnce(jsonResponse(201, { id: 'doc-1', originalName: 'guide.md', jobId: 'job-1' }));
+    const xhrCalls: Array<{ url: string; body: Blob }> = [];
+    class FakeXhr {
+      upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+      status = 200;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      onload: (() => void) | null = null;
+      private url = '';
+      open(_method: string, url: string) { this.url = url; }
+      send(body: Blob) {
+        xhrCalls.push({ url: this.url, body });
+        this.upload.onprogress?.({ lengthComputable: true, loaded: body.size } as ProgressEvent);
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() { this.onabort?.(); }
+      getResponseHeader(name: string) { return name.toLowerCase() === 'etag' ? '"part-etag"' : null; }
+    }
+    vi.stubGlobal('XMLHttpRequest', FakeXhr);
+    const onTaskCreated = vi.fn();
+    const onProgress = vi.fn();
+    const result = await api.uploadDocument(
+      'kb-1',
+      new File(['guide'], 'guide.md', { type: 'text/markdown' }),
+      onTaskCreated,
+      onProgress,
+    );
 
-    await api.uploadDocument('kb-1', new File(['guide'], 'guide.md', { type: 'text/markdown' }));
+    expect(result).toMatchObject({ id: 'doc-1', jobId: 'job-1' });
+    expect(xhrCalls).toHaveLength(1);
+    expect(xhrCalls[0]!.url).toBe('https://minio.test/signed-put');
+    expect(xhrCalls[0]!.body).toBeInstanceOf(File);
+    expect(onTaskCreated).toHaveBeenCalledWith({ id: 'doc-1', originalName: 'guide.md' });
+    expect(onProgress).toHaveBeenCalledWith(100);
+    const [createUrl, createInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(createUrl).toBe('/api/v1/knowledge-bases/kb-1/documents/uploads');
+    expect(JSON.parse(createInit.body as string)).toEqual({ originalName: 'guide.md', sizeBytes: 5 });
+    expect(new Headers(createInit.headers).get('Authorization')).toBe('Bearer session-token');
+    expect((fetchMock.mock.calls[1]![0] as string)).toBe('/api/v1/documents/doc-1/uploads/complete');
+  });
 
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(init.body).toBeInstanceOf(FormData);
-    expect(new Headers(init.headers).get('Content-Type')).toBeNull();
-    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer session-token');
+  it('uses persistent conversations and streamed messages endpoints', async () => {
+    setAccessToken('session-token');
+    fetchMock.mockResolvedValue(jsonResponse(200, []));
+    await api.createConversation('kb-1', 'Question');
+    await api.conversations('kb-1');
+    await api.conversationMessages('conversation-1');
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/conversations',
+      '/api/v1/knowledge-bases/kb-1/conversations',
+      '/api/v1/conversations/conversation-1/messages',
+    ]);
+  });
+
+  it('parses streamed answer events and forwards the abort signal', async () => {
+    setAccessToken('session-token');
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: delta\ndata: {"text":"第一段"}\n\nevent: complete\ndata: {"answer":"第一段"}\n\n'));
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValue({ ok: true, status: 200, body } as Response);
+    const abortController = new AbortController();
+    const onEvent = vi.fn();
+
+    await streamConversationMessage('conversation-1', '问题', abortController.signal, onEvent);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/conversations/conversation-1/messages/stream',
+      expect.objectContaining({ signal: abortController.signal }),
+    );
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([
+      { type: 'delta', data: { text: '第一段' } },
+      { type: 'complete', data: { answer: '第一段' } },
+    ]);
   });
 
   it('uses the workspace collaboration endpoints for invites, acceptance, and role changes', async () => {

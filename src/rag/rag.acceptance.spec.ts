@@ -73,9 +73,37 @@ function databaseUrlFor(databaseUrl: string, databaseName: string): string {
 
 function parsePrompt(body: string): { question: string; sources: PromptSource[] } {
   const requestBody = JSON.parse(body) as PromptRequest;
-  const userMessage = requestBody.messages.find((message) => message.role === 'user');
+  const userMessage = requestBody.messages.filter((message) => message.role === 'user').at(-1);
   if (!userMessage) throw new Error('LLM request has no user message');
   return JSON.parse(userMessage.content) as { question: string; sources: PromptSource[] };
+}
+
+async function uploadMarkdown(
+  server: ReturnType<INestApplication['getHttpServer']>,
+  authorization: Record<string, string>,
+  knowledgeBaseId: string,
+  originalName: string,
+  content: Buffer,
+): Promise<UploadedDocument> {
+  const started = await request(server)
+    .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents/uploads`)
+    .set(authorization)
+    .send({ originalName, sizeBytes: content.length })
+    .expect(201);
+  if (started.body.uploadMode !== 'single' || typeof started.body.uploadUrl !== 'string') {
+    throw new Error('Acceptance Markdown fixture should use a single MinIO PUT');
+  }
+  const uploaded = await fetch(started.body.uploadUrl as string, {
+    method: 'PUT',
+    body: content as unknown as BodyInit,
+  });
+  if (!uploaded.ok) throw new Error(`Presigned MinIO PUT returned HTTP ${uploaded.status}`);
+  const completed = await request(server)
+    .post(`/api/v1/documents/${started.body.document.id}/uploads/complete`)
+    .set(authorization)
+    .send({})
+    .expect(201);
+  return completed.body as UploadedDocument;
 }
 
 function fakeAnswer(question: string, sources: PromptSource[]): string {
@@ -155,8 +183,8 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
             string,
             unknown
           >;
-          outgoing.writeHead(200, { 'Content-Type': 'application/json' });
           if (requestPath.endsWith('/embeddings')) {
+            outgoing.writeHead(200, { 'Content-Type': 'application/json' });
             const input = body.input as string[];
             outgoing.end(
               JSON.stringify({
@@ -164,6 +192,7 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
               }),
             );
           } else if (requestPath.endsWith('/rerank')) {
+            outgoing.writeHead(200, { 'Content-Type': 'application/json' });
             const query = String(body.query ?? '');
             const documents = body.documents as string[];
             const results = documents
@@ -173,11 +202,19 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
           } else if (requestPath.endsWith('/chat/completions')) {
             const prompt = parsePrompt(Buffer.concat(bodyChunks).toString('utf8'));
             llmPrompts.push(prompt);
-            outgoing.end(
-              JSON.stringify({
-                choices: [{ message: { content: fakeAnswer(prompt.question, prompt.sources) } }],
-              }),
-            );
+            const answer = fakeAnswer(prompt.question, prompt.sources);
+            if (body.stream === true) {
+              outgoing.writeHead(200, { 'Content-Type': 'text/event-stream' });
+              for (let offset = 0; offset < answer.length; offset += 12) {
+                outgoing.write(
+                  `data: ${JSON.stringify({ choices: [{ delta: { content: answer.slice(offset, offset + 12) } }] })}\n\n`,
+                );
+              }
+              outgoing.end('data: [DONE]\n\n');
+            } else {
+              outgoing.writeHead(200, { 'Content-Type': 'application/json' });
+              outgoing.end(JSON.stringify({ choices: [{ message: { content: answer } }] }));
+            }
           } else {
             outgoing.writeHead(404);
             outgoing.end(JSON.stringify({ error: 'unknown test endpoint' }));
@@ -310,12 +347,15 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
     ] as const;
     const primaryDocuments: UploadedDocument[] = [];
     for (const [filename, path] of sourceFiles) {
-      const response = await request(server)
-        .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/documents`)
-        .set(ownerAuth)
-        .attach('file', readFileSync(path), { filename, contentType: 'text/markdown' })
-        .expect(201);
-      primaryDocuments.push(response.body as UploadedDocument);
+      primaryDocuments.push(
+        await uploadMarkdown(
+          server,
+          ownerAuth,
+          targetKnowledgeBase.body.id as string,
+          filename,
+          readFileSync(path),
+        ),
+      );
     }
 
     const semanticFixtures = [
@@ -324,12 +364,15 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
       ['apple.md', '苹果是一种水果。'],
     ] as const;
     for (const [filename, content] of semanticFixtures) {
-      const response = await request(server)
-        .post(`/api/v1/knowledge-bases/${targetKnowledgeBase.body.id}/documents`)
-        .set(ownerAuth)
-        .attach('file', Buffer.from(content), { filename, contentType: 'text/markdown' })
-        .expect(201);
-      primaryDocuments.push(response.body as UploadedDocument);
+      primaryDocuments.push(
+        await uploadMarkdown(
+          server,
+          ownerAuth,
+          targetKnowledgeBase.body.id as string,
+          filename,
+          Buffer.from(content),
+        ),
+      );
     }
 
     const secondRegistration = await request(server)
@@ -351,15 +394,13 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
       .set(secondUserAuth)
       .send({ name: 'Private source' })
       .expect(201);
-    const decoyResponse = await request(server)
-      .post(`/api/v1/knowledge-bases/${isolatedKnowledgeBase.body.id}/documents`)
-      .set(secondUserAuth)
-      .attach('file', Buffer.from('法国首都是里昂。'), {
-        filename: 'other-workspace-decoy.md',
-        contentType: 'text/markdown',
-      })
-      .expect(201);
-    const isolatedDocument = decoyResponse.body as UploadedDocument;
+    const isolatedDocument = await uploadMarkdown(
+      server,
+      secondUserAuth,
+      isolatedKnowledgeBase.body.id as string,
+      'other-workspace-decoy.md',
+      Buffer.from('法国首都是里昂。'),
+    );
 
     await waitForDocumentsReady(
       server,
@@ -475,6 +516,39 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
         (source: { documentName: string }) => source.documentName === 'travel-policy.md',
       ),
     ).toBe(true);
+    expect(travelAnswer.body.sources[0]).toHaveProperty('headingPath');
+
+    const savedConversation = await request(server)
+      .post('/api/v1/conversations')
+      .set(ownerAuth)
+      .send({ knowledgeBaseId: targetKnowledgeBase.body.id, title: '差旅政策追问' })
+      .expect(201);
+    const firstStream = await request(server)
+      .post(`/api/v1/conversations/${savedConversation.body.id}/messages/stream`)
+      .set(ownerAuth)
+      .send({ question: '上海住宿上限是多少？' })
+      .expect(200);
+    expect(firstStream.headers['content-type']).toContain('text/event-stream');
+    expect(firstStream.text).toContain('event: sources');
+    expect(firstStream.text).toContain('event: delta');
+    expect(firstStream.text).toContain('event: complete');
+    const secondStream = await request(server)
+      .post(`/api/v1/conversations/${savedConversation.body.id}/messages/stream`)
+      .set(ownerAuth)
+      .send({ question: '请再说明来源中还有哪些住宿城市？' })
+      .expect(200);
+    expect(secondStream.text).toContain('event: complete');
+    const savedMessages = await request(server)
+      .get(`/api/v1/conversations/${savedConversation.body.id}/messages`)
+      .set(ownerAuth)
+      .expect(200);
+    expect(savedMessages.body.map((message: { role: string }) => message.role)).toEqual([
+      'USER',
+      'ASSISTANT',
+      'USER',
+      'ASSISTANT',
+    ]);
+    expect(savedMessages.body[1].citations[0]).toHaveProperty('pageNumber');
 
     const promptsBeforeDeniedQuery = llmPrompts.length;
     await request(server)
@@ -621,26 +695,20 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
       'OWNER',
     ]);
 
-    const ownerDocument = (
-      await request(server)
-        .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
-        .set(ownerAuth)
-        .attach('file', Buffer.from('所有者上传的共享测试资料。'), {
-          filename: 'owner-shared.md',
-          contentType: 'text/markdown',
-        })
-        .expect(201)
-    ).body as UploadedDocument;
-    const memberDocument = (
-      await request(server)
-        .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
-        .set(memberAuth)
-        .attach('file', Buffer.from('成员上传的团队查询测试资料。'), {
-          filename: 'member-owned.md',
-          contentType: 'text/markdown',
-        })
-        .expect(201)
-    ).body as UploadedDocument;
+    const ownerDocument = await uploadMarkdown(
+      server,
+      ownerAuth,
+      knowledgeBaseId,
+      'owner-shared.md',
+      Buffer.from('所有者上传的共享测试资料。'),
+    );
+    const memberDocument = await uploadMarkdown(
+      server,
+      memberAuth,
+      knowledgeBaseId,
+      'member-owned.md',
+      Buffer.from('成员上传的团队查询测试资料。'),
+    );
     await waitForDocumentsReady(
       server,
       ownerAuth,

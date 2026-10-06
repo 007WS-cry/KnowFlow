@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { repairFilenameEncoding } from '../documents/filename-encoding';
 import { EmbeddingService } from '../embeddings/embedding.service';
@@ -8,6 +9,7 @@ import { KnowledgeBasesService } from '../knowledge-bases/knowledge-bases.servic
 import { LlmService } from '../llm/llm.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RerankerService } from '../reranker/reranker.service';
+import { RedisCacheService } from '../cache/redis-cache.service';
 
 export interface RetrievedChunk {
   id: string;
@@ -16,12 +18,35 @@ export interface RetrievedChunk {
   chunkIndex: number;
   content: string;
   score: number;
+  pageNumber?: number | null;
+  headingPath?: string[];
+  metadata?: Record<string, unknown> | null;
   vectorRank?: number;
   vectorScore?: number;
   keywordRank?: number;
   keywordScore?: number;
   fusionScore?: number;
   rerankScore?: number;
+}
+
+export interface RetrievalCitation {
+  citation: number;
+  documentId: string;
+  documentName: string;
+  chunkIndex: number;
+  score: number;
+  pageNumber: number | null;
+  headingPath: string[];
+}
+
+export interface RagRetrievalResult {
+  knowledgeBaseId: string;
+  question: string;
+  answerMode: 'empty' | 'llm';
+  chunks: RetrievedChunk[];
+  sources: RetrievalCitation[];
+  citations: RetrievalCitation[];
+  retrievalDebug?: Record<string, unknown>;
 }
 
 interface VectorRow extends Omit<RetrievedChunk, 'score'> {
@@ -72,9 +97,35 @@ export class RagService {
     private readonly llm: LlmService,
     private readonly reranker: RerankerService,
     private readonly config: ConfigService,
+    private readonly cache: RedisCacheService,
   ) {}
 
   async ask(userId: string, knowledgeBaseId: string, question: string, topK = 5, debug = false) {
+    const retrieval = await this.retrieve(userId, knowledgeBaseId, question, topK, debug);
+    const answer =
+      retrieval.chunks.length === 0
+        ? '当前知识库还没有可检索的已处理文档，请先上传文档并等待处理完成。'
+        : await this.llm.generateAnswer(
+            question,
+            retrieval.chunks.map((chunk, index) => ({
+              citation: index + 1,
+              documentName: chunk.documentName,
+              chunkIndex: chunk.chunkIndex,
+              content: chunk.content,
+              pageNumber: chunk.pageNumber ?? null,
+              headingPath: chunk.headingPath ?? [],
+            })),
+          );
+    return { ...retrieval, answer, answerMode: retrieval.chunks.length === 0 ? 'empty' : 'llm' };
+  }
+
+  async retrieve(
+    userId: string,
+    knowledgeBaseId: string,
+    question: string,
+    topK = 5,
+    debug = false,
+  ): Promise<RagRetrievalResult> {
     const knowledgeBase = await this.knowledgeBases.getById(knowledgeBaseId);
     const vector = await this.embeddings.embedQuery(question);
     if (!vector.some((value) => value !== 0)) {
@@ -82,6 +133,10 @@ export class RagService {
     }
     const profile = this.embeddings.getProfile(vector.length);
     await this.ensureConsistentEmbeddingProfile(profile);
+
+    const cacheKey = this.retrievalCacheKey(knowledgeBase, question, topK, debug, profile);
+    const cached = await this.cache.get<RagRetrievalResult>(cacheKey);
+    if (cached) return cached;
 
     const recallLimit = Number(this.config.get('RAG_RECALL_CANDIDATE_LIMIT', 50));
     const rerankLimit = Math.min(
@@ -123,6 +178,12 @@ export class RagService {
       chunkIndex: candidate.chunkIndex,
       content: candidate.content,
       score: candidate.rerankScore ?? candidate.fusionScore,
+      pageNumber:
+        typeof candidate.metadata?.pageNumber === 'number' ? candidate.metadata.pageNumber : null,
+      headingPath: Array.isArray(candidate.metadata?.headingPath)
+        ? candidate.metadata.headingPath.filter((part): part is string => typeof part === 'string')
+        : [],
+      metadata: candidate.metadata,
       ...(debug
         ? {
             vectorRank: candidate.vectorRank,
@@ -141,33 +202,65 @@ export class RagService {
       documentName: chunk.documentName,
       chunkIndex: chunk.chunkIndex,
       score: Number(chunk.score),
+      pageNumber: chunk.pageNumber ?? null,
+      headingPath: chunk.headingPath ?? [],
     }));
-    const answer =
-      chunks.length === 0
-        ? '当前知识库还没有可检索的已处理文档，请先上传文档并等待处理完成。'
-        : await this.llm.generateAnswer(
-            question,
-            chunks.map((chunk, index) => ({
-              citation: index + 1,
-              documentName: chunk.documentName,
-              chunkIndex: chunk.chunkIndex,
-              content: chunk.content,
-            })),
-          );
 
-    const result: Record<string, unknown> = {
+    const result: RagRetrievalResult = {
       knowledgeBaseId,
       question,
       answerMode: chunks.length === 0 ? 'empty' : 'llm',
-      answer,
       chunks,
       sources,
       citations: sources,
     };
     if (debug) {
-      result.retrievalDebug = buildRetrievalDebug(profile, vectorRows, keywordRows, fused, ordered);
+      result.retrievalDebug = buildRetrievalDebug(
+        profile,
+        vectorRows,
+        keywordRows,
+        fused,
+        ordered,
+      ) as unknown as Record<string, unknown>;
     }
+    await this.cache.set(
+      cacheKey,
+      result,
+      Number(this.config.get('RAG_RETRIEVAL_CACHE_TTL_SECONDS', 300)),
+    );
     return result;
+  }
+
+  private retrievalCacheKey(
+    knowledgeBase: { id: string; workspaceId: string; indexVersion?: number },
+    question: string,
+    topK: number,
+    debug: boolean,
+    profile: EmbeddingProfile,
+  ): string {
+    const digest = createHash('sha256')
+      .update(
+        JSON.stringify({
+          workspaceId: knowledgeBase.workspaceId,
+          knowledgeBaseId: knowledgeBase.id,
+          indexVersion: knowledgeBase.indexVersion ?? 1,
+          question: question.normalize('NFKC').trim().toLocaleLowerCase(),
+          topK,
+          debug,
+          modelConfig: {
+            embedding: profile,
+            rerankerProvider: this.config.get('RERANKER_PROVIDER', 'compatible'),
+            rerankerModel: this.config.get('RERANKER_MODEL', ''),
+            rerankerBaseUrl: this.config.get('RERANKER_BASE_URL', ''),
+            llmModel: this.config.get('LLM_MODEL', ''),
+            llmBaseUrl: this.config.get('LLM_BASE_URL', ''),
+            recallLimit: this.config.get('RAG_RECALL_CANDIDATE_LIMIT', 50),
+            rerankLimit: this.config.get('RAG_RERANK_CANDIDATE_LIMIT', 50),
+          },
+        }),
+      )
+      .digest('hex');
+    return `rag:retrieval:${digest}`;
   }
 
   private async recallByVector(
@@ -187,6 +280,7 @@ export class RagService {
         d."originalName" AS "documentName",
         c."chunkIndex",
         c."content",
+        c."metadata",
         (1 - (c."embedding"::${vectorType} <=> ${pgVector}::${vectorType}))::float8 AS "score"
       FROM "Chunk" c
       INNER JOIN "Document" d ON d."id" = c."documentId"
@@ -202,7 +296,8 @@ export class RagService {
         AND c."embeddingModel" = ${profile.model}
         AND c."embeddingVersion" = ${profile.version}
         AND c."embeddingDimension" = ${dimensionValue}
-        AND d."status" = 'READY'
+        AND d."activeIndexVersion" > 0
+        AND c."documentIndexVersion" = d."activeIndexVersion"
       ORDER BY c."embedding"::${vectorType} <=> ${pgVector}::${vectorType}
       LIMIT ${limit}
     `);
@@ -234,6 +329,7 @@ export class RagService {
         d."originalName" AS "documentName",
         c."chunkIndex",
         c."content",
+        c."metadata",
         (
           ts_rank_cd(to_tsvector('simple', c."content"), q.terms)
           + similarity(c."content", q.phrase)
@@ -251,7 +347,8 @@ export class RagService {
           SELECT 1 FROM "WorkspaceMember" wm
           WHERE wm."workspaceId" = kb."workspaceId" AND wm."userId" = ${userId}
         )
-        AND d."status" = 'READY'
+        AND d."activeIndexVersion" > 0
+        AND c."documentIndexVersion" = d."activeIndexVersion"
         AND (
           to_tsvector('simple', c."content") @@ q.terms
           OR c."content" % q.phrase
@@ -276,13 +373,16 @@ export class RagService {
   private async ensureConsistentEmbeddingProfile(profile: EmbeddingProfile): Promise<void> {
     const [mismatch] = await this.prisma.$queryRaw<Array<{ count: number }>>(Prisma.sql`
       SELECT COUNT(*)::int AS count
-      FROM "Chunk"
-      WHERE "embedding" IS NOT NULL
+      FROM "Chunk" c
+      INNER JOIN "Document" d ON d."id" = c."documentId"
+      WHERE c."embedding" IS NOT NULL
+        AND c."documentIndexVersion" = d."activeIndexVersion"
+        AND d."activeIndexVersion" > 0
         AND (
-          "embeddingProvider" IS DISTINCT FROM ${profile.provider}
-          OR "embeddingModel" IS DISTINCT FROM ${profile.model}
-          OR "embeddingVersion" IS DISTINCT FROM ${profile.version}
-          OR "embeddingDimension" IS DISTINCT FROM ${profile.dimension}
+          c."embeddingProvider" IS DISTINCT FROM ${profile.provider}
+          OR c."embeddingModel" IS DISTINCT FROM ${profile.model}
+          OR c."embeddingVersion" IS DISTINCT FROM ${profile.version}
+          OR c."embeddingDimension" IS DISTINCT FROM ${profile.dimension}
         )
     `);
     if (Number(mismatch?.count ?? 0) > 0) {
@@ -326,6 +426,7 @@ export function fuseRankedCandidates(
       documentName: row.documentName,
       chunkIndex: row.chunkIndex,
       content: row.content,
+      metadata: row.metadata,
       vectorRank: row.vectorRank,
       vectorScore: row.vectorScore ?? row.score,
       fusionScore: 1 / (RRF_K + (row.vectorRank ?? 1)),
@@ -345,6 +446,7 @@ export function fuseRankedCandidates(
         documentName: row.documentName,
         chunkIndex: row.chunkIndex,
         content: row.content,
+        metadata: row.metadata,
         keywordRank: row.keywordRank,
         keywordScore: row.keywordScore ?? row.score,
         fusionScore: 1 / (RRF_K + (row.keywordRank ?? 1)),

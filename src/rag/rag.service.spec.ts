@@ -12,7 +12,7 @@ import { ConfigService } from '@nestjs/config';
 import { buildSearchTerms, fuseRankedCandidates, RagService } from './rag.service';
 
 describe('RagService hybrid retrieval', () => {
-  const accessibleKnowledgeBase = { id: 'kb-1', workspaceId: 'workspace-1' };
+  const accessibleKnowledgeBase = { id: 'kb-1', workspaceId: 'workspace-1', indexVersion: 4 };
   const vectorRows = [
     {
       id: 'chunk-1',
@@ -58,6 +58,10 @@ describe('RagService hybrid retrieval', () => {
   const configMock = {
     get: jest.fn((_name: string, defaultValue: unknown) => defaultValue),
   };
+  const cacheMock = {
+    get: jest.fn().mockResolvedValue(null),
+    set: jest.fn().mockResolvedValue(undefined),
+  };
   const service = new RagService(
     prismaMock as unknown as PrismaService,
     embeddingsMock as unknown as EmbeddingService,
@@ -65,6 +69,7 @@ describe('RagService hybrid retrieval', () => {
     llmMock as unknown as LlmService,
     rerankerMock as unknown as RerankerService,
     configMock as unknown as ConfigService,
+    cacheMock as never,
   );
 
   beforeEach(() => {
@@ -78,6 +83,7 @@ describe('RagService hybrid retrieval', () => {
     embeddingsMock.toPgVector.mockReturnValue('[0.25,0.75]');
     embeddingsMock.getProfile.mockReturnValue(profile);
     knowledgeBasesMock.getById.mockResolvedValue(accessibleKnowledgeBase);
+    cacheMock.get.mockResolvedValue(null);
     llmMock.generateAnswer.mockResolvedValue('Paris is the capital. [1]');
     rerankerMock.rerank.mockImplementation(async (_question, documents) =>
       documents.map((_, index) => ({ index, score: documents.length - index })),
@@ -133,6 +139,8 @@ describe('RagService hybrid retrieval', () => {
         documentName: 'paris.md',
         chunkIndex: 0,
         content: '巴黎是法国首都。',
+        pageNumber: null,
+        headingPath: [],
       },
     ]);
     expect(result).toMatchObject({
@@ -181,6 +189,18 @@ describe('RagService hybrid retrieval', () => {
     expect(llmMock.generateAnswer).toHaveBeenCalledWith('报销制度是什么？', [
       expect.objectContaining({ documentName: filename }),
     ]);
+  });
+
+  it('uses a retrieval cache key that changes with the index version', async () => {
+    await service.retrieve('user-1', 'kb-1', 'question');
+    const firstKey = cacheMock.get.mock.calls[0]![0];
+    knowledgeBasesMock.getById.mockResolvedValueOnce({
+      ...accessibleKnowledgeBase,
+      indexVersion: 5,
+    });
+    await service.retrieve('user-1', 'kb-1', 'question');
+    const secondKey = cacheMock.get.mock.calls[1]![0];
+    expect(firstKey).not.toBe(secondKey);
   });
 });
 

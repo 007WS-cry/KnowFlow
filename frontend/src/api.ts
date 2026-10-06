@@ -10,6 +10,9 @@ import type {
   WorkspaceMember,
   Workspace,
   WorkspaceRole,
+  UploadStartResponse,
+  ConversationSummary,
+  ConversationMessage,
 } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1';
@@ -63,6 +66,40 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 function jsonBody(body: unknown): RequestInit {
   return { method: 'POST', body: JSON.stringify(body) };
+}
+
+function directUpload(url: string, body: Blob, onProgress: (loaded: number) => void, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    xhr.open('PUT', url);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded);
+    };
+    xhr.onerror = () => {
+      cleanup();
+      reject(new Error('无法连接 MinIO，请检查公开地址及 CORS 配置'));
+    };
+    xhr.onabort = () => {
+      cleanup();
+      reject(new DOMException('上传已取消', 'AbortError'));
+    };
+    xhr.onload = () => {
+      cleanup();
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`MinIO 上传失败（${xhr.status}）`));
+        return;
+      }
+      resolve();
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    xhr.send(body);
+  });
 }
 
 export const api = {
@@ -139,14 +176,57 @@ export const api = {
     request<KnowledgeDocument[]>(
       `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents`,
     ),
-  uploadDocument: (knowledgeBaseId: string, file: File) => {
-    const body = new FormData();
-    body.append('file', file);
+  uploadDocument: async (
+    knowledgeBaseId: string,
+    file: File,
+    onTaskCreated: (document: KnowledgeDocument) => void = () => undefined,
+    onProgress: (percent: number) => void = () => undefined,
+    signal?: AbortSignal,
+  ) => {
+    const started = await request<UploadStartResponse>(
+      `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/uploads`,
+      jsonBody({ originalName: file.name, sizeBytes: file.size }),
+    );
+    onTaskCreated(started.document);
+    if (started.uploadMode === 'single') {
+      await directUpload(started.uploadUrl!, file, (loaded) => onProgress(Math.round((loaded / file.size) * 100)), signal);
+      return request<KnowledgeDocument & { jobId: string | null }>(
+        `/documents/${encodeURIComponent(started.document.id)}/uploads/complete`,
+        jsonBody({}),
+      );
+    }
+
+    const partSize = started.partSizeBytes!;
+    const partCount = started.partCount!;
+    for (let partNumber = 1; partNumber <= partCount; partNumber += 1) {
+      if (signal?.aborted) throw new DOMException('上传已取消', 'AbortError');
+      const { uploadUrl } = await request<{ uploadUrl: string }>(
+        `/documents/${encodeURIComponent(started.document.id)}/uploads/parts/url`,
+        jsonBody({ partNumber }),
+      );
+      const start = (partNumber - 1) * partSize;
+      const end = Math.min(start + partSize, file.size);
+      await directUpload(
+        uploadUrl,
+        file.slice(start, end),
+        (loaded) => onProgress(Math.round(((start + loaded) / file.size) * 100)),
+        signal,
+      );
+    }
     return request<KnowledgeDocument & { jobId: string | null }>(
-      `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents`,
-      { method: 'POST', body },
+      `/documents/${encodeURIComponent(started.document.id)}/uploads/complete`,
+      jsonBody({}),
     );
   },
+  retryDocument: (documentId: string) =>
+    request<KnowledgeDocument>(`/documents/${encodeURIComponent(documentId)}/retry`, jsonBody({})),
+  reindexDocument: (documentId: string) =>
+    request<KnowledgeDocument>(`/documents/${encodeURIComponent(documentId)}/reindex`, jsonBody({})),
+  cancelDocument: (documentId: string) =>
+    request<{ documentId: string; cancellationRequested: boolean; status: string }>(
+      `/documents/${encodeURIComponent(documentId)}/cancel`,
+      jsonBody({}),
+    ),
   deleteDocuments: (knowledgeBaseId: string, documentIds: string[]) =>
     request<{ deletedCount: number; deletedIds: string[] }>(
       `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents`,
@@ -155,4 +235,47 @@ export const api = {
 
   ask: (knowledgeBaseId: string, question: string, topK = 5) =>
     request<RagResponse>('/query', jsonBody({ knowledgeBaseId, question, topK })),
+  createConversation: (knowledgeBaseId: string, title: string) =>
+    request<ConversationSummary>('/conversations', jsonBody({ knowledgeBaseId, title })),
+  conversations: (knowledgeBaseId: string) =>
+    request<ConversationSummary[]>(`/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/conversations`),
+  conversationMessages: (conversationId: string) =>
+    request<ConversationMessage[]>(`/conversations/${encodeURIComponent(conversationId)}/messages`),
 };
+
+export async function streamConversationMessage(
+  conversationId: string,
+  question: string,
+  signal: AbortSignal,
+  onEvent: (event: { type: string; data: unknown }) => void,
+): Promise<void> {
+  const headers = new Headers({ 'Content-Type': 'application/json', Accept: 'text/event-stream' });
+  const token = getAccessToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(
+    `${API_BASE}/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
+    { method: 'POST', headers, body: JSON.stringify({ question }), signal },
+  );
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(() => null) as { message?: string | string[] } | null;
+    throw new Error(Array.isArray(payload?.message) ? payload.message.join('；') : payload?.message || `请求失败（${response.status}）`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split('\n\n');
+    buffer = events.pop() ?? '';
+    for (const raw of events) {
+      const event = raw.split('\n').reduce((result, line) => {
+        if (line.startsWith('event:')) result.type = line.slice(6).trim();
+        if (line.startsWith('data:')) result.data += line.slice(5).trim();
+        return result;
+      }, { type: 'message', data: '' });
+      if (event.data) onEvent({ type: event.type, data: JSON.parse(event.data) as unknown });
+    }
+  }
+}

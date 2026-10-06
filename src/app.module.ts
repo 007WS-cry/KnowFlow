@@ -11,6 +11,8 @@ import { RerankerModule } from './reranker/reranker.module';
 import { StorageModule } from './storage/storage.module';
 import { WorkspacesModule } from './workspaces/workspaces.module';
 import { envValidationSchema } from './config/env.validation';
+import { RedisCacheModule } from './cache/redis-cache.module';
+import { ConversationsModule } from './conversations/conversations.module';
 
 @Module({
   imports: [
@@ -22,11 +24,13 @@ import { envValidationSchema } from './config/env.validation';
         abortEarly: false,
       },
     }),
+    RedisCacheModule,
     AuthModule,
     WorkspacesModule,
     KnowledgeBasesModule,
     DocumentsModule,
     RagModule,
+    ConversationsModule,
     RerankerModule,
     PrismaModule,
     QueueModule,

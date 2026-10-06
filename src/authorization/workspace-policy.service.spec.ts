@@ -8,7 +8,7 @@ describe('WorkspacePolicyService role matrix', () => {
     workspace: { findUnique: jest.fn() },
     workspaceMember: { findUnique: jest.fn() },
     workspaceInvitation: { findFirst: jest.fn() },
-    document: { findMany: jest.fn() },
+    document: { findMany: jest.fn(), findUnique: jest.fn() },
   };
   const policy = new WorkspacePolicyService(prisma as unknown as PrismaService);
 
@@ -22,6 +22,7 @@ describe('WorkspacePolicyService role matrix', () => {
       status: 'PENDING',
     });
     prisma.document.findMany.mockResolvedValue([{ id: 'doc-1', uploadedByUserId: 'user-1' }]);
+    prisma.document.findUnique.mockResolvedValue({ uploadedByUserId: 'user-1' });
   });
 
   async function authorize(
@@ -36,16 +37,17 @@ describe('WorkspacePolicyService role matrix', () => {
   }
 
   it.each([
-    ['MEMBER', 'WORKSPACE_VIEW'],
-    ['MEMBER', 'KNOWLEDGE_BASE_VIEW'],
-    ['MEMBER', 'DOCUMENT_VIEW'],
-    ['MEMBER', 'DOCUMENT_UPLOAD'],
-    ['ADMIN', 'KNOWLEDGE_BASE_MANAGE'],
-    ['OWNER', 'KNOWLEDGE_BASE_MANAGE'],
-    ['OWNER', 'WORKSPACE_UPDATE'],
-    ['OWNER', 'WORKSPACE_DELETE'],
-  ] as const)('allows %s to perform %s', async (role, action) => {
-    await expect(authorize(WorkspaceRole[role], action)).resolves.toMatchObject({
+    ['MEMBER', 'WORKSPACE_VIEW', {}],
+    ['MEMBER', 'KNOWLEDGE_BASE_VIEW', {}],
+    ['MEMBER', 'DOCUMENT_VIEW', {}],
+    ['MEMBER', 'DOCUMENT_UPLOAD', {}],
+    ['MEMBER', 'DOCUMENT_PROCESS', { documentId: 'doc-1' }],
+    ['ADMIN', 'KNOWLEDGE_BASE_MANAGE', {}],
+    ['OWNER', 'KNOWLEDGE_BASE_MANAGE', {}],
+    ['OWNER', 'WORKSPACE_UPDATE', {}],
+    ['OWNER', 'WORKSPACE_DELETE', {}],
+  ] as const)('allows %s to perform %s', async (role, action, params) => {
+    await expect(authorize(WorkspaceRole[role], action, 'user-1', params)).resolves.toMatchObject({
       workspaceId: 'workspace-1',
       role: WorkspaceRole[role],
     });
