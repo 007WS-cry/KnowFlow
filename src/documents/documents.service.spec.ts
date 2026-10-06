@@ -16,6 +16,7 @@ describe('DocumentsService upload pipeline', () => {
   const document = {
     id: 'document-1',
     knowledgeBaseId: 'kb-1',
+    uploadedByUserId: 'user-1',
     originalName: 'notes.txt',
     mimeType: 'text/plain',
     objectKey: 'workspace-1/kb-1/object/notes.txt',
@@ -67,7 +68,7 @@ describe('DocumentsService upload pipeline', () => {
     }),
   };
   const knowledgeBases = {
-    getAccessible: jest.fn().mockResolvedValue({ id: 'kb-1', workspaceId: 'workspace-1' }),
+    getById: jest.fn().mockResolvedValue({ id: 'kb-1', workspaceId: 'workspace-1' }),
   };
   const service = new DocumentsService(
     prismaMock as unknown as PrismaService,
@@ -95,7 +96,7 @@ describe('DocumentsService upload pipeline', () => {
       events.push('queue');
       return 'job-document-1';
     });
-    knowledgeBases.getAccessible.mockResolvedValue({ id: 'kb-1', workspaceId: 'workspace-1' });
+    knowledgeBases.getById.mockResolvedValue({ id: 'kb-1', workspaceId: 'workspace-1' });
   });
 
   it('stores a supported file, creates its DB record, then enqueues processing', async () => {
@@ -114,6 +115,7 @@ describe('DocumentsService upload pipeline', () => {
     expect(createdRecord).toEqual(
       expect.objectContaining({
         knowledgeBaseId: 'kb-1',
+        uploadedByUserId: 'user-1',
         originalName: 'notes.txt',
         mimeType: 'text/plain',
         sizeBytes: BigInt(payload.size),
@@ -159,7 +161,7 @@ describe('DocumentsService upload pipeline', () => {
       },
     ]);
 
-    const result = await service.list('user-1', 'kb-1');
+    const result = await service.list('kb-1');
 
     expect(result[0]).toMatchObject({
       id: 'document-legacy',

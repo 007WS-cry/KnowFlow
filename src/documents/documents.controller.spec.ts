@@ -2,6 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { AuthGuard } from '../auth/auth.guard';
+import { WorkspacePolicyGuard } from '../authorization/workspace-policy.guard';
 import { DocumentsController } from './documents.controller';
 import { DocumentsService } from './documents.service';
 import { UploadedFile } from './uploaded-file';
@@ -9,9 +10,11 @@ import { UploadedFile } from './uploaded-file';
 describe('DocumentsController multipart filename encoding', () => {
   let app: INestApplication;
   let moduleRef: TestingModule;
-  const upload = jest.fn(async (_userId: string, _knowledgeBaseId: string, file?: UploadedFile) => ({
-    originalName: file?.originalname,
-  }));
+  const upload = jest.fn(
+    async (_userId: string, _knowledgeBaseId: string, file?: UploadedFile) => ({
+      originalName: file?.originalname,
+    }),
+  );
 
   beforeAll(async () => {
     moduleRef = await Test.createTestingModule({
@@ -20,7 +23,9 @@ describe('DocumentsController multipart filename encoding', () => {
     })
       .overrideGuard(AuthGuard)
       .useValue({
-        canActivate: (context: { switchToHttp: () => { getRequest: () => { user?: unknown } } }) => {
+        canActivate: (context: {
+          switchToHttp: () => { getRequest: () => { user?: unknown } };
+        }) => {
           context.switchToHttp().getRequest().user = {
             id: 'user-1',
             email: 'user@example.com',
@@ -29,6 +34,8 @@ describe('DocumentsController multipart filename encoding', () => {
           return true;
         },
       })
+      .overrideGuard(WorkspacePolicyGuard)
+      .useValue({ canActivate: () => true })
       .compile();
 
     app = moduleRef.createNestApplication();

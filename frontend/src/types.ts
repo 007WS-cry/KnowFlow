@@ -20,6 +20,38 @@ export interface Workspace {
   createdAt: string;
 }
 
+export type WorkspaceRole = 'OWNER' | 'ADMIN' | 'MEMBER';
+
+export interface WorkspaceMember {
+  userId: string;
+  email: string;
+  name: string | null;
+  role: WorkspaceRole;
+  joinedAt: string;
+}
+
+export interface WorkspaceInvitation {
+  id: string;
+  email: string;
+  role: Exclude<WorkspaceRole, 'OWNER'>;
+  status: 'PENDING';
+  expiresAt: string;
+  createdAt: string;
+  invitedBy: { name: string | null; email: string } | null;
+}
+
+export interface WorkspaceInvitationResponse {
+  email: string;
+  role: Exclude<WorkspaceRole, 'OWNER'>;
+  invitationToken: string;
+  expiresAt: string;
+}
+
+export interface AcceptedWorkspaceInvitation {
+  workspace: { id: string; name: string };
+  role: WorkspaceRole;
+}
+
 export interface KnowledgeBase {
   id: string;
   workspaceId: string;
@@ -34,6 +66,8 @@ export type DocumentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
 
 export interface KnowledgeDocument {
   id: string;
+  uploadedByUserId: string | null;
+  uploadedByUser: { name: string | null; email: string } | null;
   originalName: string;
   mimeType: string;
   sizeBytes: number;

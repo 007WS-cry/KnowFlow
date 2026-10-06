@@ -542,6 +542,235 @@ describe('RAG full acceptance with PostgreSQL + pgvector', () => {
       'utf8',
     );
   });
+
+  it('enforces OWNER, ADMIN, and MEMBER permissions through the shared policy guard', async () => {
+    if (!app) throw new Error('Nest test app was not initialized');
+    const server = app.getHttpServer();
+    const documentQueue = app.get<Queue>(getQueueToken(DOCUMENT_PROCESSING_QUEUE));
+    const suffix = `${process.pid}-${Date.now()}`;
+    const register = async (email: string, name: string) =>
+      request(server)
+        .post('/api/v1/auth/register')
+        .send({ email, password: 'acceptance-password', name })
+        .expect(201);
+
+    const ownerRegistration = await register(`permissions-owner-${suffix}@example.test`, 'Owner');
+    const ownerAuth = { Authorization: `Bearer ${ownerRegistration.body.accessToken}` };
+    const workspace = await request(server)
+      .post('/api/v1/workspaces')
+      .set(ownerAuth)
+      .send({ name: `Permissions ${suffix}` })
+      .expect(201);
+    const workspaceId = workspace.body.id as string;
+    const targetKb = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(ownerAuth)
+      .send({ name: 'Shared policy tests' })
+      .expect(201);
+    const knowledgeBaseId = targetKb.body.id as string;
+
+    const adminEmail = `permissions-admin-${suffix}@example.test`;
+    const ownerAdminInvite = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(ownerAuth)
+      .send({ email: adminEmail, role: 'ADMIN' })
+      .expect(201);
+    const wrongRegistration = await register(
+      `permissions-wrong-${suffix}@example.test`,
+      'Wrong user',
+    );
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set({ Authorization: `Bearer ${wrongRegistration.body.accessToken}` })
+      .send({ token: ownerAdminInvite.body.invitationToken })
+      .expect(403);
+    const adminRegistration = await register(adminEmail, 'Admin');
+    const adminAuth = { Authorization: `Bearer ${adminRegistration.body.accessToken}` };
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set(adminAuth)
+      .send({ token: ownerAdminInvite.body.invitationToken })
+      .expect(201);
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set(adminAuth)
+      .send({ token: ownerAdminInvite.body.invitationToken })
+      .expect(409);
+
+    const memberEmail = `permissions-member-${suffix}@example.test`;
+    const memberInvite = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(adminAuth)
+      .send({ email: memberEmail, role: 'MEMBER' })
+      .expect(201);
+    const memberRegistration = await register(memberEmail, 'Member');
+    const memberAuth = { Authorization: `Bearer ${memberRegistration.body.accessToken}` };
+    await request(server)
+      .post('/api/v1/invitations/accept')
+      .set(memberAuth)
+      .send({ token: memberInvite.body.invitationToken })
+      .expect(201);
+
+    const membersResponse = await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/members`)
+      .set(ownerAuth)
+      .expect(200);
+    expect(membersResponse.body.map((member: { role: string }) => member.role).sort()).toEqual([
+      'ADMIN',
+      'MEMBER',
+      'OWNER',
+    ]);
+
+    const ownerDocument = (
+      await request(server)
+        .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+        .set(ownerAuth)
+        .attach('file', Buffer.from('所有者上传的共享测试资料。'), {
+          filename: 'owner-shared.md',
+          contentType: 'text/markdown',
+        })
+        .expect(201)
+    ).body as UploadedDocument;
+    const memberDocument = (
+      await request(server)
+        .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+        .set(memberAuth)
+        .attach('file', Buffer.from('成员上传的团队查询测试资料。'), {
+          filename: 'member-owned.md',
+          contentType: 'text/markdown',
+        })
+        .expect(201)
+    ).body as UploadedDocument;
+    await waitForDocumentsReady(
+      server,
+      ownerAuth,
+      [ownerDocument.id, memberDocument.id],
+      documentQueue,
+      workerErrors,
+    );
+
+    await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(memberAuth)
+      .expect(200);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(memberAuth)
+      .send({ name: 'Member cannot create this' })
+      .expect(403);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}`)
+      .set(memberAuth)
+      .send({ name: 'Member cannot rename this' })
+      .expect(403);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(memberAuth)
+      .send({ email: `blocked-${suffix}@example.test`, role: 'MEMBER' })
+      .expect(403);
+    await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(memberAuth)
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+      .set(memberAuth)
+      .send({ documentIds: [ownerDocument.id] })
+      .expect(403);
+    expect(await app.get(PrismaService).document.count({ where: { id: ownerDocument.id } })).toBe(
+      1,
+    );
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+      .set(memberAuth)
+      .send({ documentIds: [memberDocument.id] })
+      .expect(200);
+    const memberQuery = await request(server)
+      .post(`/api/v1/knowledge-bases/${knowledgeBaseId}/query`)
+      .set(memberAuth)
+      .send({ question: '团队资料里有哪些信息？', topK: 3 })
+      .expect(201);
+    expect(memberQuery.body.knowledgeBaseId).toBe(knowledgeBaseId);
+
+    const adminKnowledgeBase = await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(adminAuth)
+      .send({ name: 'Admin managed KB' })
+      .expect(201);
+    await request(server)
+      .patch(`/api/v1/knowledge-bases/${knowledgeBaseId}`)
+      .set(adminAuth)
+      .send({ description: 'Updated by admin' })
+      .expect(200);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/invitations`)
+      .set(adminAuth)
+      .send({ email: `blocked-admin-${suffix}@example.test`, role: 'ADMIN' })
+      .expect(403);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(adminAuth)
+      .send({ role: 'ADMIN' })
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${ownerRegistration.body.user.id}`)
+      .set(adminAuth)
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${adminRegistration.body.user.id}`)
+      .set(adminAuth)
+      .expect(403);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}`)
+      .set(adminAuth)
+      .send({ name: 'Admin cannot rename this' })
+      .expect(403);
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${knowledgeBaseId}/documents`)
+      .set(adminAuth)
+      .send({ documentIds: [ownerDocument.id] })
+      .expect(200);
+    await request(server)
+      .delete(`/api/v1/knowledge-bases/${adminKnowledgeBase.body.id}`)
+      .set(adminAuth)
+      .expect(200);
+    await request(server).delete(`/api/v1/workspaces/${workspaceId}`).set(adminAuth).expect(403);
+
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(ownerAuth)
+      .send({ role: 'ADMIN' })
+      .expect(200);
+    await request(server)
+      .post(`/api/v1/workspaces/${workspaceId}/knowledge-bases`)
+      .set(memberAuth)
+      .send({ name: 'Promoted member can manage KBs' })
+      .expect(201);
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(ownerAuth)
+      .send({ role: 'MEMBER' })
+      .expect(200);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${memberRegistration.body.user.id}`)
+      .set(adminAuth)
+      .expect(200);
+    await request(server)
+      .get(`/api/v1/workspaces/${workspaceId}/members`)
+      .set(memberAuth)
+      .expect(404);
+
+    await request(server)
+      .patch(`/api/v1/workspaces/${workspaceId}`)
+      .set(ownerAuth)
+      .send({ name: 'Owner updated this workspace' })
+      .expect(200);
+    await request(server)
+      .delete(`/api/v1/workspaces/${workspaceId}/members/${ownerRegistration.body.user.id}`)
+      .set(ownerAuth)
+      .expect(403);
+    await request(server).delete(`/api/v1/workspaces/${workspaceId}`).set(ownerAuth).expect(200);
+  });
 });
 
 async function waitForDocumentsReady(

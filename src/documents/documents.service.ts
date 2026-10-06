@@ -1,8 +1,4 @@
-import {
-  BadRequestException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import { Document as DocumentModel, DocumentStatus } from '@prisma/client';
@@ -26,13 +22,14 @@ export class DocumentsService {
     private readonly knowledgeBases: KnowledgeBasesService,
   ) {}
 
-  async list(userId: string, knowledgeBaseId: string) {
-    await this.knowledgeBases.getAccessible(userId, knowledgeBaseId);
+  async list(knowledgeBaseId: string) {
     const documents = await this.prisma.document.findMany({
       where: { knowledgeBaseId },
       orderBy: { createdAt: 'desc' },
       select: {
         id: true,
+        uploadedByUserId: true,
+        uploadedByUser: { select: { name: true, email: true } },
         originalName: true,
         mimeType: true,
         sizeBytes: true,
@@ -68,13 +65,15 @@ export class DocumentsService {
     }
     this.validateFileSignature(extension, file.buffer);
 
-    const knowledgeBase = await this.knowledgeBases.getAccessible(userId, knowledgeBaseId);
+    const knowledgeBase = await this.knowledgeBases.getById(knowledgeBaseId);
     const mimeType = this.mimeTypeFor(extension);
     const objectKey = `${knowledgeBase.workspaceId}/${knowledgeBase.id}/${randomUUID()}/${originalName}`;
 
-    await this.storage.getClient().putObject(this.storage.getBucket(), objectKey, file.buffer, file.size, {
-      'Content-Type': mimeType,
-    });
+    await this.storage
+      .getClient()
+      .putObject(this.storage.getBucket(), objectKey, file.buffer, file.size, {
+        'Content-Type': mimeType,
+      });
 
     let document: DocumentModel;
     try {
@@ -82,6 +81,7 @@ export class DocumentsService {
         const created = await tx.document.create({
           data: {
             knowledgeBaseId,
+            uploadedByUserId: userId,
             originalName,
             mimeType,
             objectKey,
@@ -95,7 +95,10 @@ export class DocumentsService {
         return created;
       });
     } catch (error) {
-      await this.storage.getClient().removeObject(this.storage.getBucket(), objectKey).catch(() => undefined);
+      await this.storage
+        .getClient()
+        .removeObject(this.storage.getBucket(), objectKey)
+        .catch(() => undefined);
       throw error;
     }
 
@@ -116,8 +119,7 @@ export class DocumentsService {
     };
   }
 
-  async deleteMany(userId: string, knowledgeBaseId: string, documentIds: string[]) {
-    await this.knowledgeBases.getAccessible(userId, knowledgeBaseId);
+  async deleteMany(knowledgeBaseId: string, documentIds: string[]) {
     const documents = await this.prisma.document.findMany({
       where: { knowledgeBaseId, id: { in: documentIds } },
       select: { id: true, objectKey: true },
@@ -146,12 +148,13 @@ export class DocumentsService {
     return { deletedCount: result.count, deletedIds: documentIds };
   }
 
-  async getStatus(userId: string, documentId: string) {
+  async getStatus(documentId: string) {
     const document = await this.prisma.document.findUnique({
       where: { id: documentId },
       select: {
         id: true,
-        knowledgeBaseId: true,
+        uploadedByUserId: true,
+        uploadedByUser: { select: { name: true, email: true } },
         originalName: true,
         mimeType: true,
         sizeBytes: true,
@@ -163,10 +166,8 @@ export class DocumentsService {
       },
     });
     if (!document) throw new NotFoundException('文档不存在');
-    await this.knowledgeBases.getAccessible(userId, document.knowledgeBaseId);
-    const { knowledgeBaseId: _knowledgeBaseId, ...safeDocument } = document;
     return {
-      ...safeDocument,
+      ...document,
       originalName: repairFilenameEncoding(document.originalName),
       sizeBytes: Number(document.sizeBytes),
     };

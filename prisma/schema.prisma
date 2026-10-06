@@ -20,15 +20,24 @@ enum DocumentStatus {
   FAILED
 }
 
+enum WorkspaceInvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
 model User {
-  id               String            @id @default(cuid())
-  email            String            @unique
-  name             String?
-  passwordHash     String?
-  createdAt        DateTime          @default(now()) @db.Timestamptz(6)
-  updatedAt        DateTime          @updatedAt @db.Timestamptz(6)
-  workspaceMembers WorkspaceMember[]
-  sessions         Session[]
+  id                String                @id @default(cuid())
+  email             String                @unique
+  name              String?
+  passwordHash      String?
+  createdAt         DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime              @updatedAt @db.Timestamptz(6)
+  workspaceMembers  WorkspaceMember[]
+  sessions          Session[]
+  uploadedDocuments Document[]            @relation("DocumentUploader")
+  sentInvitations   WorkspaceInvitation[] @relation("WorkspaceInvitationSender")
 }
 
 model Session {
@@ -43,13 +52,14 @@ model Session {
 }
 
 model Workspace {
-  id             String            @id @default(cuid())
+  id             String                @id @default(cuid())
   name           String
-  slug           String            @unique
-  createdAt      DateTime          @default(now()) @db.Timestamptz(6)
-  updatedAt      DateTime          @updatedAt @db.Timestamptz(6)
+  slug           String                @unique
+  createdAt      DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime              @updatedAt @db.Timestamptz(6)
   members        WorkspaceMember[]
   knowledgeBases KnowledgeBase[]
+  invitations    WorkspaceInvitation[]
 }
 
 model WorkspaceMember {
@@ -63,6 +73,25 @@ model WorkspaceMember {
 
   @@unique([workspaceId, userId])
   @@index([userId])
+}
+
+model WorkspaceInvitation {
+  id              String                    @id @default(cuid())
+  workspaceId     String
+  email           String
+  role            WorkspaceRole             @default(MEMBER)
+  tokenHash       String                    @unique
+  status          WorkspaceInvitationStatus @default(PENDING)
+  invitedByUserId String?
+  expiresAt       DateTime                  @db.Timestamptz(6)
+  acceptedAt      DateTime?                 @db.Timestamptz(6)
+  createdAt       DateTime                  @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime                  @updatedAt @db.Timestamptz(6)
+  workspace       Workspace                 @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy       User?                     @relation("WorkspaceInvitationSender", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([workspaceId, email])
+  @@index([workspaceId, status, expiresAt])
 }
 
 model KnowledgeBase {
@@ -80,21 +109,24 @@ model KnowledgeBase {
 }
 
 model Document {
-  id              String         @id @default(cuid())
-  knowledgeBaseId String
-  originalName    String
-  mimeType        String
-  objectKey       String         @unique
-  sizeBytes       BigInt
-  status          DocumentStatus @default(PENDING)
-  errorMessage    String?
-  processedAt     DateTime?      @db.Timestamptz(6)
-  createdAt       DateTime       @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime       @updatedAt @db.Timestamptz(6)
-  knowledgeBase   KnowledgeBase  @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
-  chunks          Chunk[]
+  id               String         @id @default(cuid())
+  knowledgeBaseId  String
+  uploadedByUserId String?
+  originalName     String
+  mimeType         String
+  objectKey        String         @unique
+  sizeBytes        BigInt
+  status           DocumentStatus @default(PENDING)
+  errorMessage     String?
+  processedAt      DateTime?      @db.Timestamptz(6)
+  createdAt        DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime       @updatedAt @db.Timestamptz(6)
+  knowledgeBase    KnowledgeBase  @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  uploadedByUser   User?          @relation("DocumentUploader", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+  chunks           Chunk[]
 
   @@index([knowledgeBaseId, status])
+  @@index([uploadedByUserId])
 }
 
 model Chunk {

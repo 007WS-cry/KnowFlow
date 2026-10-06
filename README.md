@@ -65,16 +65,56 @@ npm run dev
 
 仅修改 TypeScript 源码不需要重新生成 Prisma Client 或运行数据库迁移。只有修改 Prisma schema 或迁移文件时才需要执行相应的 Prisma 命令。
 
-## MVP 操作流程
+## Workspace 协作与权限
 
-API 路径前缀为 `/api/v1`。除注册和登录外，其他业务请求需带上 `Authorization: Bearer <accessToken>`。注册或登录后按下面顺序调用：
+API 路径前缀为 `/api/v1`。除注册和登录外，业务请求需带上 `Authorization: Bearer <accessToken>`。Workspace 权限在后端统一检查；前端隐藏按钮只是界面引导，直接调用 API 也会执行相同的权限规则。
+
+| 操作                                           | OWNER | ADMIN | MEMBER |
+| ---------------------------------------------- | :---: | :---: | :----: |
+| 查看 Workspace、成员、知识库、文档；查询和上传 |   ✓   |   ✓   |   ✓    |
+| 创建、编辑、删除知识库；删除任意成员的文档     |   ✓   |   ✓   |   —    |
+| 删除自己上传的文档                             |   ✓   |   ✓   |   ✓    |
+| 邀请或移除 MEMBER；撤销 MEMBER 邀请            |   ✓   |   ✓   |   —    |
+| 邀请 ADMIN、修改成员角色、移除 ADMIN           |   ✓   |   —   |   —    |
+| 重命名或删除 Workspace                         |   ✓   |   —   |   —    |
+
+新注册并创建 Workspace 的用户自动成为 OWNER。OWNER 可以将其他成员在 ADMIN 与 MEMBER 之间切换；系统不允许通过普通角色修改转让 OWNER。ADMIN 不能变更任何角色，也不能邀请、移除或撤销 ADMIN。成员不能通过成员管理移除自己或 OWNER。
+
+### 在前端邀请团队成员
+
+1. OWNER 或 ADMIN 登录后，在顶部点击“团队成员”。OWNER 可邀请 ADMIN 或 MEMBER；ADMIN 只能邀请 MEMBER。
+2. 输入对方注册 KnowFlow 使用的邮箱和角色，创建邀请后复制页面显示的邀请链接。当前版本不发送邮件；邀请链接仅创建时显示。再次邀请同一邮箱会刷新凭证并使旧链接失效。
+3. 接收者打开链接后注册或登录**与邀请邮箱一致**的账号。登录后页面会自动接受邀请并切换到加入的 Workspace。邀请有效期为 7 天且只能接受一次；如邮箱不一致，请退出并改用受邀邮箱登录。
+4. “团队成员”窗口显示成员、角色和待处理邀请。OWNER 可以修改角色、移除 ADMIN 或 MEMBER；ADMIN 只能移除 MEMBER。OWNER 不能移除自己或删除自己的 OWNER 角色。
+
+### 手动验证三种角色
+
+建议用三个不同邮箱和独立浏览器会话操作；本地测试可打开普通窗口和无痕窗口，避免切换账号时混淆邀请链接与登录态。
+
+1. 用 OWNER 账号创建 Workspace 和一个知识库，再从顶部“团队成员”分别邀请一个 ADMIN 和一个 MEMBER。将两条链接分别交给对应测试账号，注册/登录时使用完全相同的邮箱。
+2. 用 MEMBER 登录：打开已有知识库，确认可以查看成员、上传文档和提问；上传后确认文档行显示自己是上传者，只有自己上传的文档可以勾选删除。确认知识库列表旁没有创建按钮、知识库页没有设置菜单，“团队成员”中没有邀请、角色修改和移除操作。
+3. 用 ADMIN 登录：创建、编辑、删除知识库；上传并删除任意成员的文档；从“团队成员”邀请 MEMBER 和移除 MEMBER。确认不能邀请 ADMIN、修改角色、移除 ADMIN/OWNER，也不能重命名或删除 Workspace。
+4. 用 OWNER 登录：在“团队成员”中将 MEMBER 提升为 ADMIN，使用该账号刷新后确认管理知识库的入口出现；再降回 MEMBER，确认入口消失。确认 OWNER 可以邀请 ADMIN、变更其他成员角色、移除 ADMIN/MEMBER、重命名 Workspace；不能移除自己。
+5. 重新打开一条已使用的邀请链接应显示凭证已处理；用不同邮箱接受待处理邀请应失败。若链接丢失，OWNER/ADMIN 可在“团队成员”中对同一邮箱重新创建邀请并复制新链接，旧链接随之失效。
+
+成员邀请相关 API：
+
+- `GET /workspaces/{workspaceId}/members`：列出 Workspace 成员。所有成员均可查看。
+- `POST /workspaces/{workspaceId}/invitations`：创建或刷新邀请，JSON 示例 `{"email":"teammate@example.com","role":"MEMBER"}`。OWNER 也可指定 `ADMIN`；省略 role 时默认为 MEMBER。
+- `GET /workspaces/{workspaceId}/invitations`：查看待处理邀请，仅 OWNER/ADMIN 可用。
+- `DELETE /workspaces/{workspaceId}/invitations/{invitationId}`：撤销邀请；ADMIN 仅能撤销 MEMBER 邀请。
+- `POST /invitations/accept`：接受邀请，JSON 为 `{"token":"<邀请链接凭证>"}`，仅当前邮箱与邀请邮箱一致时成功。
+- `PATCH /workspaces/{workspaceId}/members/{userId}`：修改为 `ADMIN` 或 `MEMBER`，仅 OWNER 可用。
+- `DELETE /workspaces/{workspaceId}/members/{userId}`：移除成员，OWNER 可移除 ADMIN/MEMBER，ADMIN 仅可移除 MEMBER。
+
+### 基本知识库操作
 
 1. `POST /auth/register` 或 `POST /auth/login` 获取 access token；`GET /auth/me` 获取当前用户，`POST /auth/logout` 退出。
-2. Workspace 支持 `POST /workspaces` 创建、`GET /workspaces` 列表、`GET /workspaces/{workspaceId}` 详情、`PATCH /workspaces/{workspaceId}` 更新和 `DELETE /workspaces/{workspaceId}` 删除。只有 Workspace 所有者可以更新或删除。
-3. Knowledge Base 使用 `POST`、`GET /workspaces/{workspaceId}/knowledge-bases` 创建和列表；单项详情、更新、删除使用 `GET`、`PATCH`、`DELETE /knowledge-bases/{knowledgeBaseId}`。所有操作均要求用户属于该 Workspace。
+2. Workspace 支持 `POST /workspaces` 创建、`GET /workspaces` 列表、`GET /workspaces/{workspaceId}` 详情、`PATCH /workspaces/{workspaceId}` 更新和 `DELETE /workspaces/{workspaceId}` 删除。只有 OWNER 可以重命名或删除。
+3. Knowledge Base 使用 `POST`、`GET /workspaces/{workspaceId}/knowledge-bases` 创建和列表；单项详情、更新、删除使用 `GET`、`PATCH`、`DELETE /knowledge-bases/{knowledgeBaseId}`。所有成员可查看；创建、编辑、删除仅 OWNER/ADMIN 可用。
 4. `GET /knowledge-bases/{knowledgeBaseId}/documents` 查看文档。新建知识库默认返回空数组。
-5. `POST /knowledge-bases/{knowledgeBaseId}/documents` 以 `multipart/form-data` 上传字段 `file`。支持 TXT、Markdown、PDF、DOCX，默认最大 10 MB。上传文件名按 UTF-8 解码；早期因 Latin-1 解码保存的中文乱码文件名会在列表、状态和 RAG 引用响应中自动恢复显示。文档进入 BullMQ 后台处理，轮询文档列表或 `GET /documents/{documentId}` 可查看 `PENDING`、`PROCESSING`、`READY` 或 `FAILED` 状态。
-6. `DELETE /knowledge-bases/{knowledgeBaseId}/documents` 按 ID 批量删除：`{"documentIds":["doc_id_1","doc_id_2"]}`。这会同时删除 MinIO 对象和 PostgreSQL 中的文档及 chunks。
+5. `POST /knowledge-bases/{knowledgeBaseId}/documents` 以 `multipart/form-data` 上传字段 `file`。支持 TXT、Markdown、PDF、DOCX，默认最大 10 MB。上传文件名按 UTF-8 解码；早期因 Latin-1 解码保存的中文乱码文件名会在列表、状态和 RAG 引用响应中自动恢复显示。文档列表包含上传者；历史文档或已删除账号的上传者显示为空。文档进入 BullMQ 后台处理，轮询文档列表或 `GET /documents/{documentId}` 可查看 `PENDING`、`PROCESSING`、`READY` 或 `FAILED` 状态。
+6. `DELETE /knowledge-bases/{knowledgeBaseId}/documents` 按 ID 批量删除：`{"documentIds":["doc_id_1","doc_id_2"]}`。MEMBER 只能删除自己上传的文档；ADMIN/OWNER 可删除任意文档。这会同时删除 MinIO 对象和 PostgreSQL 中的文档及 chunks。
 7. `POST /query` 提问：`{"knowledgeBaseId":"kb_id","question":"差旅报销的流程是什么？","topK":5}`。响应包含 LLM `answer`、重排后的 `chunks`、`sources` 与 `citations`。需要调试检索时加入 `"debug":true`，响应会附 `retrievalDebug`，列出候选的向量名次、关键词名次、融合分数和重排分数。旧路径 `POST /knowledge-bases/{knowledgeBaseId}/query` 仍可使用。
 
 注册请求示例：
@@ -124,6 +164,7 @@ src/
   embeddings/             # OpenAI-compatible / 本地 Embedding Provider 与重建命令
   health/                 # 健康检查
   knowledge-bases/        # 知识库 CRUD 与成员权限检查
+  authorization/          # Workspace 角色矩阵与统一 Policy Guard
   prisma/                 # Prisma client 生命周期
   queue/                  # BullMQ 队列
   rag/                    # 双路召回、RRF 融合、检索调试与 RAG 查询
@@ -144,7 +185,7 @@ Compose 从 MinIO 官方源码构建固定版本并提供本地 S3 API。MinIO �
 
 文档处理链路为 MinIO 上传、Prisma 文档记录、BullMQ 入队、Worker 文本解析与分块、Embedding 计算、pgvector 批量写入，完成后将文档标记为 `READY`。处理失败会清除已写入的 chunks、记录错误并抛出异常，让 BullMQ 按退避策略重试；每次重试会先清理该文档已有 chunks，避免重复写入。
 
-`npm test` 统一运行 Jest 测试。单元测试覆盖认证、请求校验、Workspace/Knowledge Base CRUD 与隔离、Provider 响应校验、RRF、RAG 调试数据，以及文档处理与重试幂等性。另有一条完整验收测试会使用 PostgreSQL + pgvector、Redis/BullMQ 和 MinIO，执行注册、创建 Workspace/知识库、上传 Markdown、等待 Worker 完成、确认向量及模型元数据落库，并发起混合检索、重排和 RAG 查询。请先启动 Compose 依赖（`docker compose up -d postgres redis minio`）并确保 `.env` 中数据库连接指向 `localhost`；测试会创建带随机名称的独立 PostgreSQL 数据库、执行实际迁移，结束后删除该测试库。验收测试使用本地假 Embedding、Reranker 和 LLM 服务，不会消耗外部 API key，并通过唯一 BullMQ 前缀隔离正在运行的应用队列。样例语料位于 `test/fixtures/rag-acceptance/`。
+`npm test` 统一运行 Jest 测试。单元测试覆盖认证、请求校验、统一 Workspace Policy 的角色矩阵、Workspace/Knowledge Base 数据操作、Provider 响应校验、RRF、RAG 调试数据，以及文档处理与重试幂等性。RAG 验收测试会使用 PostgreSQL + pgvector、Redis/BullMQ 和 MinIO，执行注册、创建 Workspace/知识库、上传 Markdown、等待 Worker 完成、确认向量及模型元数据落库，并发起混合检索、重排和 RAG 查询；协作验收还会通过 HTTP 验证 OWNER/ADMIN/MEMBER 权限和邀请接受流程。请先启动 Compose 依赖（`docker compose up -d postgres redis minio`）并确保 `.env` 中数据库连接指向 `localhost`；测试会创建带随机名称的独立 PostgreSQL 数据库、执行实际迁移，结束后删除该测试库。验收测试使用本地假 Embedding、Reranker 和 LLM 服务，不会消耗外部 API key，并通过唯一 BullMQ 前缀隔离正在运行的应用队列。样例语料位于 `test/fixtures/rag-acceptance/`。
 
 固定评测集位于 `test/fixtures/rag-evaluation/questions.json`，包含 56 道问题及相关文档标注，覆盖现有三份示例语料。将这些 Markdown 文档上传到一个知识库后，设置有权访问该知识库的 ID 和 access token，再运行：
 

@@ -45,6 +45,27 @@ describe('frontend API client', () => {
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer session-token');
   });
 
+  it('uses the workspace collaboration endpoints for invites, acceptance, and role changes', async () => {
+    setAccessToken('session-token');
+    fetchMock.mockResolvedValue(jsonResponse(200, {}));
+
+    await api.inviteWorkspaceMember('team/one', 'new@example.com', 'ADMIN');
+    await api.acceptWorkspaceInvitation('opaque-token');
+    await api.updateWorkspaceMemberRole('team/one', 'user/one', 'MEMBER');
+    await api.removeWorkspaceMember('team/one', 'user/one');
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, (init as RequestInit).method])).toEqual([
+      ['/api/v1/workspaces/team%2Fone/invitations', 'POST'],
+      ['/api/v1/invitations/accept', 'POST'],
+      ['/api/v1/workspaces/team%2Fone/members/user%2Fone', 'PATCH'],
+      ['/api/v1/workspaces/team%2Fone/members/user%2Fone', 'DELETE'],
+    ]);
+    expect(JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string)).toEqual({
+      email: 'new@example.com',
+      role: 'ADMIN',
+    });
+  });
+
   it('joins backend validation errors into a readable message', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse(400, { message: ['邮箱格式无效', '密码至少需要 8 位'], statusCode: 400 }),

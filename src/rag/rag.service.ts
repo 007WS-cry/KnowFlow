@@ -75,7 +75,7 @@ export class RagService {
   ) {}
 
   async ask(userId: string, knowledgeBaseId: string, question: string, topK = 5, debug = false) {
-    const knowledgeBase = await this.knowledgeBases.getAccessible(userId, knowledgeBaseId);
+    const knowledgeBase = await this.knowledgeBases.getById(knowledgeBaseId);
     const vector = await this.embeddings.embedQuery(question);
     if (!vector.some((value) => value !== 0)) {
       throw new BadRequestException('问题中没有可用于检索的文字');

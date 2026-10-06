@@ -1,10 +1,15 @@
 import type {
   KnowledgeBase,
   KnowledgeDocument,
+  AcceptedWorkspaceInvitation,
   RagResponse,
   SessionResponse,
   User,
+  WorkspaceInvitation,
+  WorkspaceInvitationResponse,
+  WorkspaceMember,
   Workspace,
+  WorkspaceRole,
 } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1';
@@ -44,15 +49,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (response.status === 204) return undefined as T;
   const payload = (await response.json().catch(() => null)) as
-    | { message?: string | string[]; error?: string }
-    | T
-    | null;
+    { message?: string | string[]; error?: string } | T | null;
 
   if (!response.ok) {
-    const message = payload && typeof payload === 'object' && 'message' in payload
-      ? payload.message
-      : null;
-    throw new Error(Array.isArray(message) ? message.join('；') : message || `请求失败（${response.status}）`);
+    const message =
+      payload && typeof payload === 'object' && 'message' in payload ? payload.message : null;
+    throw new Error(
+      Array.isArray(message) ? message.join('；') : message || `请求失败（${response.status}）`,
+    );
   }
   return payload as T;
 }
@@ -70,8 +74,7 @@ export const api = {
   logout: () => request<{ success: true }>('/auth/logout', jsonBody({})),
 
   workspaces: () => request<Workspace[]>('/workspaces'),
-  createWorkspace: (name: string) =>
-    request<Workspace>('/workspaces', jsonBody({ name })),
+  createWorkspace: (name: string) => request<Workspace>('/workspaces', jsonBody({ name })),
   updateWorkspace: (id: string, name: string) =>
     request<Workspace>(`/workspaces/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -81,14 +84,47 @@ export const api = {
     request<{ success: true; id: string }>(`/workspaces/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+  workspaceMembers: (id: string) =>
+    request<WorkspaceMember[]>(`/workspaces/${encodeURIComponent(id)}/members`),
+  workspaceInvitations: (id: string) =>
+    request<WorkspaceInvitation[]>(`/workspaces/${encodeURIComponent(id)}/invitations`),
+  inviteWorkspaceMember: (
+    id: string,
+    email: string,
+    role: Exclude<WorkspaceRole, 'OWNER'> = 'MEMBER',
+  ) =>
+    request<WorkspaceInvitationResponse>(
+      `/workspaces/${encodeURIComponent(id)}/invitations`,
+      jsonBody({ email, role }),
+    ),
+  acceptWorkspaceInvitation: (token: string) =>
+    request<AcceptedWorkspaceInvitation>('/invitations/accept', jsonBody({ token })),
+  revokeWorkspaceInvitation: (workspaceId: string, invitationId: string) =>
+    request<{ success: true; id: string }>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/invitations/${encodeURIComponent(invitationId)}`,
+      { method: 'DELETE' },
+    ),
+  removeWorkspaceMember: (workspaceId: string, userId: string) =>
+    request<{ success: true; userId: string }>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' },
+    ),
+  updateWorkspaceMemberRole: (
+    workspaceId: string,
+    userId: string,
+    role: Exclude<WorkspaceRole, 'OWNER'>,
+  ) =>
+    request<WorkspaceMember>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: JSON.stringify({ role }) },
+    ),
 
   knowledgeBases: (workspaceId: string) =>
     request<KnowledgeBase[]>(`/workspaces/${encodeURIComponent(workspaceId)}/knowledge-bases`),
   createKnowledgeBase: (workspaceId: string, name: string, description: string) =>
-    request<KnowledgeBase>(
-      `/workspaces/${encodeURIComponent(workspaceId)}/knowledge-bases`,
-      { ...jsonBody({ name, description }) },
-    ),
+    request<KnowledgeBase>(`/workspaces/${encodeURIComponent(workspaceId)}/knowledge-bases`, {
+      ...jsonBody({ name, description }),
+    }),
   updateKnowledgeBase: (id: string, name: string, description: string) =>
     request<KnowledgeBase>(`/knowledge-bases/${encodeURIComponent(id)}`, {
       method: 'PATCH',

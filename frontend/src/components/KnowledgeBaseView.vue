@@ -3,9 +3,9 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox, type UploadRequestOptions } from 'element-plus';
 import { api, getErrorMessage } from '../api';
 import { formatBytes, formatDate, statusText, statusType } from '../presenters';
-import type { KnowledgeBase, KnowledgeDocument, RagResponse } from '../types';
+import type { KnowledgeBase, KnowledgeDocument, RagResponse, WorkspaceRole } from '../types';
 
-const props = defineProps<{ knowledgeBase: KnowledgeBase }>();
+const props = defineProps<{ knowledgeBase: KnowledgeBase; workspaceRole: WorkspaceRole; currentUserId: string }>();
 const emit = defineEmits<{ edit: []; delete: []; documentsChanged: [] }>();
 
 const activeTab = ref<'documents' | 'ask'>('documents');
@@ -25,6 +25,12 @@ const processingCount = computed(
   () => documents.value.filter((item) => item.status === 'PENDING' || item.status === 'PROCESSING').length,
 );
 const selectableIds = computed(() => new Set(documents.value.map((item) => item.id)));
+const canManageKnowledgeBase = computed(() => props.workspaceRole !== 'MEMBER');
+const canDeleteAnyDocument = computed(() => props.workspaceRole !== 'MEMBER');
+
+function canSelectDocument(document: KnowledgeDocument): boolean {
+  return canDeleteAnyDocument.value || document.uploadedByUserId === props.currentUserId;
+}
 
 async function loadDocuments(showLoading = false): Promise<void> {
   if (documentRequestInProgress) return;
@@ -158,7 +164,7 @@ function openFilePicker(): void {
         <p>{{ knowledgeBase.description || '整理文件，向你的资料提问。' }}</p>
       </div>
       <div class="heading-actions">
-        <el-dropdown trigger="click" @command="(command: string) => command === 'edit' ? emit('edit') : emit('delete')">
+        <el-dropdown v-if="canManageKnowledgeBase" trigger="click" @command="(command: string) => command === 'edit' ? emit('edit') : emit('delete')">
           <el-button class="more-button" aria-label="知识库设置"><el-icon><MoreFilled /></el-icon></el-button>
           <template #dropdown>
             <el-dropdown-menu>
@@ -223,7 +229,7 @@ function openFilePicker(): void {
         v-loading="documentsLoading"
         @selection-change="onSelectionChange"
       >
-        <el-table-column type="selection" width="48" />
+        <el-table-column type="selection" width="48" :selectable="canSelectDocument" />
         <el-table-column label="文件名称" min-width="250">
           <template #default="scope">
             <div class="file-cell">
@@ -240,6 +246,11 @@ function openFilePicker(): void {
             <el-tag v-else :type="statusType(scope.row.status)" effect="light" round>{{ statusText(scope.row.status) }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="上传者" min-width="160">
+          <template #default="scope">
+            <span class="muted-text">{{ scope.row.uploadedByUser?.name || scope.row.uploadedByUser?.email || (workspaceRole === 'MEMBER' ? '历史文档（需管理员删除）' : '历史文档') }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="添加时间" width="170">
           <template #default="scope"><span class="muted-text">{{ formatDate(scope.row.createdAt) }}</span></template>
         </el-table-column>
@@ -251,7 +262,7 @@ function openFilePicker(): void {
           </div>
         </template>
       </el-table>
-      <p class="privacy-note"><el-icon><Lock /></el-icon>上传的文件只会在你的知识库中检索。</p>
+      <p class="privacy-note"><el-icon><Lock /></el-icon>上传的文件只会在此知识库中检索。{{ workspaceRole === 'MEMBER' ? '你可以删除自己上传的文档；历史文档和其他成员的文档由管理员管理。' : '管理员可以管理知识库和其中的所有文档。' }}</p>
     </div>
 
     <section v-show="activeTab === 'ask'" class="ask-pane">

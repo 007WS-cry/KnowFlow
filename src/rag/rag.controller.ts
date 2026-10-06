@@ -3,18 +3,25 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AuthGuard } from '../auth/auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { AuthenticatedUser } from '../auth/auth.types';
+import {
+  knowledgeBaseBody,
+  knowledgeBaseParam,
+  RequireWorkspacePermission,
+} from '../authorization/workspace-permissions';
+import { WorkspacePolicyGuard } from '../authorization/workspace-policy.guard';
 import { AskQuestionDto } from './dto/ask-question.dto';
 import { QueryByKnowledgeBaseDto } from './dto/query-by-knowledge-base.dto';
 import { RagService } from './rag.service';
 
 @ApiTags('rag')
 @ApiBearerAuth()
-@UseGuards(AuthGuard)
+@UseGuards(AuthGuard, WorkspacePolicyGuard)
 @Controller()
 export class RagController {
   constructor(private readonly rag: RagService) {}
 
   @Post('query')
+  @RequireWorkspacePermission('KNOWLEDGE_BASE_VIEW', knowledgeBaseBody('knowledgeBaseId'))
   askByKnowledgeBase(
     @CurrentUser() user: AuthenticatedUser,
     @Body() body: QueryByKnowledgeBaseDto,
@@ -23,6 +30,7 @@ export class RagController {
   }
 
   @Post('knowledge-bases/:knowledgeBaseId/query')
+  @RequireWorkspacePermission('KNOWLEDGE_BASE_VIEW', knowledgeBaseParam('knowledgeBaseId'))
   ask(
     @CurrentUser() user: AuthenticatedUser,
     @Param('knowledgeBaseId') knowledgeBaseId: string,

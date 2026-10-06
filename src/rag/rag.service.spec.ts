@@ -47,7 +47,7 @@ describe('RagService hybrid retrieval', () => {
     getProfile: jest.fn().mockReturnValue(profile),
   };
   const knowledgeBasesMock = {
-    getAccessible: jest.fn().mockResolvedValue(accessibleKnowledgeBase),
+    getById: jest.fn().mockResolvedValue(accessibleKnowledgeBase),
   };
   const llmMock = { generateAnswer: jest.fn().mockResolvedValue('Paris is the capital. [1]') };
   const rerankerMock = {
@@ -77,7 +77,7 @@ describe('RagService hybrid retrieval', () => {
     embeddingsMock.embedQuery.mockResolvedValue([0.25, 0.75]);
     embeddingsMock.toPgVector.mockReturnValue('[0.25,0.75]');
     embeddingsMock.getProfile.mockReturnValue(profile);
-    knowledgeBasesMock.getAccessible.mockResolvedValue(accessibleKnowledgeBase);
+    knowledgeBasesMock.getById.mockResolvedValue(accessibleKnowledgeBase);
     llmMock.generateAnswer.mockResolvedValue('Paris is the capital. [1]');
     rerankerMock.rerank.mockImplementation(async (_question, documents) =>
       documents.map((_, index) => ({ index, score: documents.length - index })),
@@ -87,7 +87,7 @@ describe('RagService hybrid retrieval', () => {
   it('scopes both recall channels to the requested knowledge base and workspace membership', async () => {
     const result = await service.ask('user-1', 'kb-1', 'What is in the handbook?');
     expect(result.chunks).toHaveLength(1);
-    expect(knowledgeBasesMock.getAccessible).toHaveBeenCalledWith('user-1', 'kb-1');
+    expect(knowledgeBasesMock.getById).toHaveBeenCalledWith('kb-1');
     const retrievalQueries = prismaMock.$queryRaw.mock.calls
       .map(([query]) => query as { sql: string; values: unknown[] })
       .filter(({ sql }) => sql.includes('"KnowledgeBase"'));
@@ -100,8 +100,8 @@ describe('RagService hybrid retrieval', () => {
     expect(retrievalQueries.some(({ sql }) => sql.includes('<=>'))).toBe(true);
   });
 
-  it('does not execute retrieval for an inaccessible knowledge base', async () => {
-    knowledgeBasesMock.getAccessible.mockRejectedValueOnce(new NotFoundException());
+  it('does not execute retrieval for a missing knowledge base', async () => {
+    knowledgeBasesMock.getById.mockRejectedValueOnce(new NotFoundException());
     await expect(service.ask('user-2', 'other-kb', 'question')).rejects.toBeInstanceOf(
       NotFoundException,
     );

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import zhCn from 'element-plus/es/locale/lang/zh-cn';
 import AuthView from './components/AuthView.vue';
 import KnowledgeBaseView from './components/KnowledgeBaseView.vue';
+import WorkspaceMembersDialog from './components/WorkspaceMembersDialog.vue';
 import { api, clearAccessToken, getAccessToken, getErrorMessage, setAccessToken } from './api';
 import type { KnowledgeBase, SessionResponse, User, Workspace } from './types';
 
@@ -16,6 +17,7 @@ const activeWorkspaceId = ref('');
 const activeKnowledgeBaseId = ref('');
 const isRefreshing = ref(false);
 const loadError = ref('');
+const membersDialogVisible = ref(false);
 
 type DialogMode = 'workspace' | 'editWorkspace' | 'knowledgeBase' | 'editKnowledgeBase';
 const dialogMode = ref<DialogMode>('workspace');
@@ -36,6 +38,38 @@ const dialogTitle = computed(() => ({
   editKnowledgeBase: '编辑知识库',
 }[dialogMode.value]));
 const profileInitial = computed(() => (currentUser.value?.name || currentUser.value?.email || 'K').slice(0, 1).toUpperCase());
+const canManageKnowledgeBases = computed(
+  () => activeWorkspace.value?.role === 'OWNER' || activeWorkspace.value?.role === 'ADMIN',
+);
+const isWorkspaceOwner = computed(() => activeWorkspace.value?.role === 'OWNER');
+
+function pendingInvitationToken(): string | null {
+  const match = window.location.hash.match(/(?:^#|&)invite=([^&]+)/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]!);
+  } catch {
+    return null;
+  }
+}
+
+async function acceptPendingInvitation(): Promise<void> {
+  if (!currentUser.value) return;
+  const token = pendingInvitationToken();
+  if (!token) return;
+  try {
+    const accepted = await api.acceptWorkspaceInvitation(token);
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    await loadWorkspaces(accepted.workspace.id);
+    ElMessage.success(`已加入 Workspace「${accepted.workspace.name}」，角色：${accepted.role}`);
+  } catch (error) {
+    ElMessage.error(`${getErrorMessage(error)}。请使用收到邀请的邮箱账号登录后再接受。`);
+  }
+}
+
+function onInvitationHashChange(): void {
+  if (currentUser.value) void acceptPendingInvitation();
+}
 
 async function loadKnowledgeBases(preferredId?: string): Promise<void> {
   if (!activeWorkspaceId.value) {
@@ -63,6 +97,7 @@ async function loadWorkspaces(preferredId?: string): Promise<void> {
 }
 
 onMounted(async () => {
+  window.addEventListener('hashchange', onInvitationHashChange);
   if (!getAccessToken()) {
     authReady.value = true;
     return;
@@ -70,6 +105,7 @@ onMounted(async () => {
   try {
     currentUser.value = await api.me();
     await loadWorkspaces();
+    await acceptPendingInvitation();
   } catch {
     clearAccessToken();
     currentUser.value = null;
@@ -78,6 +114,8 @@ onMounted(async () => {
   }
 });
 
+onBeforeUnmount(() => window.removeEventListener('hashchange', onInvitationHashChange));
+
 async function onAuthenticated(session: SessionResponse): Promise<void> {
   setAccessToken(session.accessToken);
   currentUser.value = session.user;
@@ -85,6 +123,7 @@ async function onAuthenticated(session: SessionResponse): Promise<void> {
   isRefreshing.value = true;
   try {
     await loadWorkspaces();
+    await acceptPendingInvitation();
   } catch (error) {
     loadError.value = getErrorMessage(error);
   } finally {
@@ -128,6 +167,7 @@ function openCreateWorkspace(): void {
 }
 
 function openCreateKnowledgeBase(): void {
+  if (!canManageKnowledgeBases.value) return;
   dialogMode.value = 'knowledgeBase';
   form.name = '';
   form.description = '';
@@ -135,7 +175,7 @@ function openCreateKnowledgeBase(): void {
 }
 
 function openEditWorkspace(): void {
-  if (!activeWorkspace.value) return;
+  if (!activeWorkspace.value || !isWorkspaceOwner.value) return;
   dialogMode.value = 'editWorkspace';
   form.name = activeWorkspace.value.name;
   form.description = '';
@@ -143,7 +183,7 @@ function openEditWorkspace(): void {
 }
 
 function openEditKnowledgeBase(): void {
-  if (!activeKnowledgeBase.value) return;
+  if (!activeKnowledgeBase.value || !canManageKnowledgeBases.value) return;
   dialogMode.value = 'editKnowledgeBase';
   form.name = activeKnowledgeBase.value.name;
   form.description = activeKnowledgeBase.value.description ?? '';
@@ -181,7 +221,7 @@ async function saveDialog(): Promise<void> {
 }
 
 async function deleteKnowledgeBase(): Promise<void> {
-  if (!activeKnowledgeBase.value) return;
+  if (!activeKnowledgeBase.value || !canManageKnowledgeBases.value) return;
   try {
     await ElMessageBox.confirm(
       `删除“${activeKnowledgeBase.value.name}”会一并删除其中的文档及处理结果。`,
@@ -197,7 +237,7 @@ async function deleteKnowledgeBase(): Promise<void> {
 }
 
 async function deleteWorkspace(): Promise<void> {
-  if (!activeWorkspace.value) return;
+  if (!activeWorkspace.value || !isWorkspaceOwner.value) return;
   try {
     await ElMessageBox.confirm(
       `删除“${activeWorkspace.value.name}”会永久删除该空间内的知识库和文档。`,
@@ -237,7 +277,7 @@ async function logout(): Promise<void> {
       <div class="sidebar-brand">
         <span class="brand-mark"><el-icon><Connection /></el-icon></span>
         <span class="brand-name">KnowFlow</span>
-        <span class="brand-pill">个人版</span>
+        <span class="brand-pill">团队空间</span>
       </div>
 
       <div class="sidebar-section workspace-section">
@@ -252,10 +292,10 @@ async function logout(): Promise<void> {
           >
             <template #prefix><span class="workspace-select-icon"><el-icon><Grid /></el-icon></span></template>
             <el-option v-for="workspace in workspaces" :key="workspace.id" :label="workspace.name" :value="workspace.id">
-              <div class="workspace-option"><span>{{ workspace.name }}</span><small>{{ workspace.role === 'OWNER' ? '所有者' : '成员' }}</small></div>
+              <div class="workspace-option"><span>{{ workspace.name }}</span><small>{{ workspace.role === 'OWNER' ? '所有者' : workspace.role === 'ADMIN' ? '管理员' : '成员' }}</small></div>
             </el-option>
           </el-select>
-          <el-dropdown v-if="activeWorkspace" trigger="click" @command="(command: string) => command === 'edit' ? openEditWorkspace() : deleteWorkspace()">
+          <el-dropdown v-if="activeWorkspace && isWorkspaceOwner" trigger="click" @command="(command: string) => command === 'edit' ? openEditWorkspace() : deleteWorkspace()">
             <el-button text class="workspace-menu-button" aria-label="Workspace 设置"><el-icon><MoreFilled /></el-icon></el-button>
             <template #dropdown>
               <el-dropdown-menu>
@@ -271,7 +311,7 @@ async function logout(): Promise<void> {
       <div class="sidebar-section library-section">
         <div class="library-heading">
           <div class="section-label"><span>知识库</span><span class="library-count">{{ knowledgeBases.length }}</span></div>
-          <el-tooltip content="新建知识库" placement="top"><el-button text circle class="add-library-button" :disabled="!activeWorkspace" aria-label="新建知识库" @click="openCreateKnowledgeBase"><el-icon><Plus /></el-icon></el-button></el-tooltip>
+          <el-tooltip v-if="canManageKnowledgeBases" content="新建知识库" placement="top"><el-button text circle class="add-library-button" :disabled="!activeWorkspace" aria-label="新建知识库" @click="openCreateKnowledgeBase"><el-icon><Plus /></el-icon></el-button></el-tooltip>
         </div>
         <div v-if="!activeWorkspace" class="sidebar-empty">先创建一个 Workspace</div>
         <div v-else-if="knowledgeBases.length === 0" class="sidebar-empty">还没有知识库</div>
@@ -285,7 +325,7 @@ async function logout(): Promise<void> {
           <span class="knowledge-nav-name">{{ knowledgeBase.name }}</span>
           <span class="knowledge-nav-count">{{ knowledgeBase._count.documents }}</span>
         </button>
-        <el-button v-if="activeWorkspace && knowledgeBases.length === 0" class="sidebar-first-create" @click="openCreateKnowledgeBase"><el-icon><Plus /></el-icon>创建知识库</el-button>
+        <el-button v-if="activeWorkspace && canManageKnowledgeBases && knowledgeBases.length === 0" class="sidebar-first-create" @click="openCreateKnowledgeBase"><el-icon><Plus /></el-icon>创建知识库</el-button>
       </div>
 
       <div class="sidebar-bottom">
@@ -305,6 +345,10 @@ async function logout(): Promise<void> {
       <header class="topbar">
         <div class="topbar-context"><span>我的空间</span><el-icon><ArrowRight /></el-icon><strong>{{ activeWorkspace?.name || 'Workspace' }}</strong></div>
         <div class="topbar-actions">
+          <el-button v-if="activeWorkspace" text class="team-members-topbar-button" @click="membersDialogVisible = true">
+            <el-icon><UserFilled /></el-icon>团队成员
+            <el-tag size="small" effect="plain">{{ activeWorkspace.role }}</el-tag>
+          </el-button>
           <span class="connection-indicator"><i></i>本地工作台</span>
           <el-tooltip content="重新加载空间和知识库" placement="bottom"><el-button text circle :loading="isRefreshing" aria-label="刷新工作台" @click="refreshData"><el-icon><Refresh /></el-icon></el-button></el-tooltip>
         </div>
@@ -315,6 +359,8 @@ async function logout(): Promise<void> {
       <KnowledgeBaseView
         v-if="activeKnowledgeBase"
         :knowledge-base="activeKnowledgeBase"
+        :workspace-role="activeWorkspace?.role ?? 'MEMBER'"
+        :current-user-id="currentUser.id"
         @edit="openEditKnowledgeBase"
         @delete="deleteKnowledgeBase"
         @documents-changed="loadKnowledgeBases(activeKnowledgeBaseId)"
@@ -323,9 +369,10 @@ async function logout(): Promise<void> {
       <section v-else class="welcome-view">
         <div class="welcome-copy">
           <p class="eyebrow">YOUR KNOWLEDGE, IN FLOW</p>
-          <h1>{{ activeWorkspace ? '搭建你的第一个知识库' : '欢迎来到 KnowFlow' }}</h1>
-          <p>{{ activeWorkspace ? '从上传资料开始，把零散的信息变成随时可查的答案。' : '创建一个 Workspace 来安放你的知识库和资料。' }}</p>
-          <el-button v-if="activeWorkspace" type="primary" size="large" @click="openCreateKnowledgeBase"><el-icon><Plus /></el-icon>创建知识库</el-button>
+          <h1>{{ activeWorkspace ? (canManageKnowledgeBases ? '搭建你的第一个知识库' : '等待团队知识库就绪') : '欢迎来到 KnowFlow' }}</h1>
+          <p>{{ activeWorkspace ? (canManageKnowledgeBases ? '从上传资料开始，把零散的信息变成随时可查的答案。' : '管理员创建知识库后，你就可以上传团队资料并开始提问。') : '创建一个 Workspace 来安放你的知识库和资料。' }}</p>
+          <el-button v-if="activeWorkspace && canManageKnowledgeBases" type="primary" size="large" @click="openCreateKnowledgeBase"><el-icon><Plus /></el-icon>创建知识库</el-button>
+          <el-button v-else-if="activeWorkspace" type="primary" size="large" @click="membersDialogVisible = true"><el-icon><UserFilled /></el-icon>查看团队成员</el-button>
           <el-button v-else type="primary" size="large" @click="openCreateWorkspace"><el-icon><Plus /></el-icon>创建 Workspace</el-button>
         </div>
         <div class="welcome-art" aria-hidden="true">
@@ -335,13 +382,13 @@ async function logout(): Promise<void> {
           <span class="art-spark art-spark-one">✦</span><span class="art-spark art-spark-two">✧</span><span class="art-orbit"></span>
         </div>
         <div class="welcome-steps">
-          <article><span class="step-number">01</span><span class="step-icon"><el-icon><Collection /></el-icon></span><strong>创建知识库</strong><small>按主题整理你的资料</small></article>
+          <article><span class="step-number">01</span><span class="step-icon"><el-icon><Collection /></el-icon></span><strong>{{ canManageKnowledgeBases ? '创建知识库' : '打开团队知识库' }}</strong><small>{{ canManageKnowledgeBases ? '按主题整理你的资料' : '查看管理员创建的资料库' }}</small></article>
           <el-icon class="step-arrow"><ArrowRight /></el-icon>
           <article><span class="step-number">02</span><span class="step-icon"><el-icon><Upload /></el-icon></span><strong>上传文档</strong><small>支持常见办公文件</small></article>
           <el-icon class="step-arrow"><ArrowRight /></el-icon>
           <article><span class="step-number">03</span><span class="step-icon"><el-icon><ChatDotRound /></el-icon></span><strong>开始提问</strong><small>答案附带原文来源</small></article>
         </div>
-        <div class="welcome-foot"><span><el-icon><Lock /></el-icon>你的资料按 Workspace 隔离存储</span><span>KnowFlow Personal</span></div>
+        <div class="welcome-foot"><span><el-icon><Lock /></el-icon>你的资料按 Workspace 隔离存储</span><span>KnowFlow Workspace</span></div>
       </section>
     </main>
 
@@ -359,6 +406,14 @@ async function logout(): Promise<void> {
         <el-button type="primary" :disabled="!form.name.trim()" :loading="saving" @click="saveDialog">保存</el-button>
       </template>
     </el-dialog>
+
+    <WorkspaceMembersDialog
+      v-if="activeWorkspace && currentUser"
+      v-model="membersDialogVisible"
+      :workspace="activeWorkspace"
+      :current-user="currentUser"
+      @changed="refreshData"
+    />
   </div>
   </el-config-provider>
 </template>
